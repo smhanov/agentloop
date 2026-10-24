@@ -1,0 +1,3 @@
+/.plans/
+/testdata-live/*
+!/testdata-live/README.md
