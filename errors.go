@@ -22,4 +22,8 @@ var (
 	// ErrStreamStale reports a streaming run aborted because no chunk
 	// arrived within the WithStreamWatchdog window.
 	ErrStreamStale = errors.New("agentloop: stream stale")
+	// ErrTooManyPinnedSkills reports a WithPinnedSkills call naming more
+	// than two skills; at most two bodies may be inlined into the system
+	// prompt.
+	ErrTooManyPinnedSkills = errors.New("agentloop: too many pinned skills")
 )

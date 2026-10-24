@@ -34,6 +34,9 @@ func New(llm *llmhub.Client, opts ...Option) (*Agent, error) {
 		toolChoice:     llmhub.AutoToolChoice(),
 	}
 	applyOptions(&cfg, opts)
+	if err := resolveSkills(&cfg); err != nil {
+		return nil, err
+	}
 	return &Agent{llm: llm, cfg: cfg}, nil
 }
 

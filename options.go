@@ -33,6 +33,12 @@ type config struct {
 	generateOptions []llmhub.Option
 	hooks           Hooks
 	settings        map[string]any
+	// skillDirs and pinnedNames record construction-time skill intent
+	// (WithSkills / WithPinnedSkills). resolveSkills consumes them once in
+	// New, so the catalog and pinned bodies are frozen at construction;
+	// the fields stay untouched by per-call option application.
+	skillDirs   []string
+	pinnedNames []string
 }
 
 // effectiveMaxToolCalls returns the tool-execution budget for a run.
