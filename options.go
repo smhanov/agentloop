@@ -32,6 +32,7 @@ type config struct {
 	toolChoice      llmhub.ToolChoice
 	generateOptions []llmhub.Option
 	hooks           Hooks
+	settings        map[string]any
 }
 
 // effectiveMaxToolCalls returns the tool-execution budget for a run.
@@ -155,4 +156,26 @@ func WithGenerateOptions(opts ...llmhub.Option) Option {
 // extension surface. Unset hook fields are no-ops.
 func WithHooks(h Hooks) Option {
 	return func(c *config) { c.hooks = h }
+}
+
+// WithSetting attaches a named value to the option list on behalf of the
+// preset that defines it. The core itself ignores settings; a preset reads
+// them back with Settings to decode its own options before forwarding the
+// option list to New. Later options with the same key win.
+func WithSetting(key string, value any) Option {
+	return func(c *config) {
+		if c.settings == nil {
+			c.settings = make(map[string]any)
+		}
+		c.settings[key] = value
+	}
+}
+
+// Settings applies opts in order to a throwaway configuration and returns
+// the values attached with WithSetting, keyed by name (nil when none).
+// The returned map is a snapshot; mutating it affects no Agent.
+func Settings(opts ...Option) map[string]any {
+	var c config
+	applyOptions(&c, opts)
+	return c.settings
 }
