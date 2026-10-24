@@ -1,9 +1,11 @@
 // Package bash implements the mini-swe-agent-compatible coding preset: a
 // coding agent that solves tasks by executing shell commands in an
-// Environment until it reports completion. The protocol, templates, limits,
-// exit statuses, and submission mechanism follow mini-swe-agent; the loop
-// itself is the unmodified agentloop core driven through hooks — the
-// AfterGenerate finish veto keeps the run going without native tool calls.
+// Environment until it reports completion. The templates, limits, exit
+// statuses, and submission mechanism follow mini-swe-agent; the loop itself
+// is the unmodified agentloop core. Two transports drive it: the default
+// text-action protocol (an AfterGenerate finish veto keeps the run going
+// without native tool calls) and WithToolProtocol's native `bash` tool —
+// same observations, limits, and exit statuses, different wire format.
 package bash
 
 import (
@@ -44,8 +46,9 @@ const (
 	// responses; 0 would mean unlimited.
 	defaultMaxConsecutiveFormatErrors = 3
 	// coreDefaultMaxToolCalls mirrors the core loop's default tool budget.
-	// The preset registers no native tools, so this is the value the hard
-	// step ceiling (2*MaxToolCalls+2) derives from.
+	// The text protocol registers no native tools, so this is the value the
+	// hard step ceiling (2*MaxToolCalls+2) derives from; in tool mode it is
+	// also the default bash-execution budget.
 	coreDefaultMaxToolCalls = 5
 )
 
@@ -144,17 +147,23 @@ func WithApprover(fn func(ctx context.Context, command string) error) Option {
 	return agentloop.WithSetting(settingApprover, fn)
 }
 
-// WithToolProtocol selects the native tool-calling transport instead of
-// the text protocol. The flag is recognized and reserved: the native
-// tool implementation is not part of this release yet, and the
-// mini-swe-agent-compatible text protocol is used regardless.
+// WithToolProtocol selects the native tool-calling transport instead of the
+// default text protocol: the preset registers a `bash` tool (schema
+// {"command": string}) and the model drives the run with tool calls. The
+// observation formatting, submit detection, limits, approval gate, and exit
+// statuses are identical to the text protocol's; the run ends naturally
+// when the model stops calling tools, or with ExitSubmitted once a
+// command's output announces the submit marker. The format-error machinery
+// is a text-protocol concept and does not run in tool mode. The preset owns
+// the registered tool set in this mode: core WithTools options passed
+// alongside are overridden.
 func WithToolProtocol() Option {
 	return agentloop.WithSetting(settingToolProtocol, true)
 }
 
 // WithHooks installs additional hook callbacks that compose with the
 // protocol's internal hooks: for the two hooks the protocol owns
-// (BeforeGenerate for limits, AfterGenerate for the text protocol) the
+// (BeforeGenerate for limits, AfterGenerate for the selected transport) the
 // protocol hooks run first and the caller's hooks observe the event
 // afterwards; all other hook fields pass through untouched. Prefer this
 // over agentloop.WithHooks, which replaces the whole hook set and would
@@ -264,8 +273,8 @@ func hardStepCeiling(stepLimit int) int {
 }
 
 // Agent is the bash coding preset: an immutable wrapper around the core
-// agentloop.Agent wiring the text-action protocol, the limits, and the
-// approval gate. Safe for concurrent use.
+// agentloop.Agent wiring the selected action protocol (text or native
+// tool), the limits, and the approval gate. Safe for concurrent use.
 type Agent struct {
 	agent *agentloop.Agent
 	opts  []Option // construction options, re-applied per Ask for overrides
@@ -324,8 +333,9 @@ func (a *Agent) Agent() *agentloop.Agent { return a.agent }
 
 // Answer is a bash run's result: the core trace plus mini-swe-agent's exit
 // status and submission. ExitStatus is empty only when the run ended
-// through the core loop without a preset-level outcome — reachable only
-// with native tool-call responses, which the text protocol never produces.
+// through the core loop without a preset-level outcome — the tool
+// protocol's natural termination (the model stopped calling tools), which
+// the text protocol never produces.
 type Answer struct {
 	*agentloop.Answer
 	// ExitStatus reports how the run ended: ExitSubmitted,
@@ -393,6 +403,19 @@ func (a *Agent) prepare(merged []Option, task string) (runExtras, *runState, err
 		BeforeGenerate: p.beforeGenerate,
 		AfterGenerate:  p.afterGenerate,
 	}
+	coreOpts := append([]Option(nil), merged...)
+	if cfg.toolProtocol {
+		// Tool protocol: the native bash tool replaces the text-protocol
+		// AfterGenerate hook — only the limits' step/cost counter stays.
+		// Termination is the loop's natural one (the model stops calling
+		// tools), and the preset owns the registered tool set.
+		hooks.AfterGenerate = p.countStep
+		coreOpts = append(coreOpts, agentloop.WithTools(agentloop.Tool{
+			Def:        bashToolDef(cfg.submitMarker),
+			Run:        p.handleToolCall,
+			Sequential: true, // one stateful shell: strict call order, no overlap
+		}))
+	}
 	if user, ok := agentloop.Settings(merged...)[settingHooks].(agentloop.Hooks); ok {
 		hooks = composeHooks(hooks, user)
 	}
@@ -400,7 +423,6 @@ func (a *Agent) prepare(merged []Option, task string) (runExtras, *runState, err
 	if err != nil {
 		return runExtras{}, nil, err
 	}
-	coreOpts := append([]Option(nil), merged...)
 	coreOpts = append(coreOpts,
 		agentloop.WithSystemPrompt(systemPrompt),
 		agentloop.WithHooks(hooks),
@@ -446,10 +468,14 @@ func newProtocol(cfg presetConfig, st *runState) (*protocol, error) {
 // beforeGenerate enforces the graceful limits before each inference:
 // step count, cumulative cost, and wall-clock time. Each maps to
 // mini-swe-agent's exit statuses; the wall-time limit specifically yields
-// ExitTimeExceeded.
+// ExitTimeExceeded. A tool call that hit the submit marker stops here too —
+// the earliest point after the execution (the tool protocol's submission
+// stop; the text protocol ends inside AfterGenerate instead).
 func (p *protocol) beforeGenerate(ctx context.Context, ev *agentloop.Event) error {
 	cfg, st := p.cfg, p.st
 	switch {
+	case st.exitStatus == ExitSubmitted:
+		ev.Skip = true
 	case cfg.stepLimit > 0 && st.steps >= cfg.stepLimit,
 		cfg.costLimit > 0 && st.cost >= cfg.costLimit:
 		st.exitStatus = ExitLimitsExceeded
@@ -467,12 +493,12 @@ type approvalError struct {
 }
 
 // afterGenerate implements the text-action protocol: parse exactly one
-// fenced command from the response, execute it, append the formatted
-// observation as a user message, and veto the finish so the loop
-// continues. Zero or multiple blocks append format-error guidance and
-// count toward the consecutive-error stop. Submit detection wraps every
-// execution: the marker on the first output line of a successful command
-// ends the run.
+// fenced command from the response, execute it through the shared path
+// (runCommand), append the formatted observation as a user message, and
+// veto the finish so the loop continues. Zero or multiple blocks append
+// format-error guidance and count toward the consecutive-error stop. Submit
+// detection wraps every execution: the marker on the first output line of a
+// successful command ends the run.
 func (p *protocol) afterGenerate(ctx context.Context, ev *agentloop.Event) error {
 	st := p.st
 	st.steps++
@@ -484,48 +510,66 @@ func (p *protocol) afterGenerate(ctx context.Context, ev *agentloop.Event) error
 		return p.formatError(ev, len(commands))
 	}
 	st.fmtErrs = 0 // a cleanly parsed step resets the counter
-	command := commands[0]
 
-	if p.cfg.approver != nil {
-		if err := p.cfg.approver(ctx, command); err != nil {
-			return p.appendVeto(ev, err)
-		}
-	}
-
-	res, err := p.cfg.environment.Execute(ctx, command)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err() // the caller aborted; surface the cancellation
-		}
-		return fmt.Errorf("bash: execute: %w", err)
-	}
-	observation, err := formatObservation(res, p.cfg.outputLimit, p.obsTmpl)
+	out, err := p.runCommand(ctx, commands[0])
 	if err != nil {
 		return err
 	}
-	ev.Messages = append(ev.Messages, llmhub.NewUserMessage(llmhub.Text(observation)))
-
-	if submission, ok := detectSubmission(res.Output, p.cfg.submitMarker, res.ReturnCode); ok {
+	ev.Messages = append(ev.Messages, llmhub.NewUserMessage(llmhub.Text(out.observation)))
+	if out.submitted {
 		st.exitStatus = ExitSubmitted
-		st.submission = submission
+		st.submission = out.submission
 		return nil // leave Finish true: the run ends here
 	}
 	ev.Finish = false
 	return nil
 }
 
-// appendVeto appends the approval-gate rejection as an observation and
-// keeps the run going so the model can adjust.
-func (p *protocol) appendVeto(ev *agentloop.Event, err error) error {
-	payload, marshalErr := json.Marshal(approvalError{
-		Error: fmt.Sprintf("command not approved: %v", err),
-	})
-	if marshalErr != nil {
-		return fmt.Errorf("bash: encode approval error: %w", marshalErr)
+// commandOutcome is the shared execution path's result for one model
+// command: the model-facing observation (the §8.4 shape) and the
+// submit-marker outcome (§8.3.4). An approval-gate veto yields the JSON
+// not-approved observation with submitted=false; the run continues either
+// way.
+type commandOutcome struct {
+	observation string
+	submission  string
+	submitted   bool
+}
+
+// runCommand executes one model-chosen command through the path both
+// protocols share: the approval gate (a veto becomes the JSON not-approved
+// observation), Environment.Execute, the observation formatter, and
+// submit-marker detection. Only infrastructure failures and caller
+// cancellation return an error — every agent-level outcome is expressed as
+// the observation instead.
+func (p *protocol) runCommand(ctx context.Context, command string) (commandOutcome, error) {
+	if p.cfg.approver != nil {
+		if err := p.cfg.approver(ctx, command); err != nil {
+			payload, marshalErr := json.Marshal(approvalError{
+				Error: fmt.Sprintf("command not approved: %v", err),
+			})
+			if marshalErr != nil {
+				return commandOutcome{}, fmt.Errorf("bash: encode approval error: %w", marshalErr)
+			}
+			return commandOutcome{observation: string(payload)}, nil
+		}
 	}
-	ev.Messages = append(ev.Messages, llmhub.NewUserMessage(llmhub.Text(string(payload))))
-	ev.Finish = false
-	return nil
+	res, err := p.cfg.environment.Execute(ctx, command)
+	if err != nil {
+		if ctx.Err() != nil {
+			return commandOutcome{}, ctx.Err() // the caller aborted; surface the cancellation
+		}
+		return commandOutcome{}, fmt.Errorf("bash: execute: %w", err)
+	}
+	observation, err := formatObservation(res, p.cfg.outputLimit, p.obsTmpl)
+	if err != nil {
+		return commandOutcome{}, err
+	}
+	out := commandOutcome{observation: observation}
+	if submission, ok := detectSubmission(res.Output, p.cfg.submitMarker, res.ReturnCode); ok {
+		out.submission, out.submitted = submission, true
+	}
+	return out, nil
 }
 
 // formatError appends the format-error guidance for a response with count

@@ -465,23 +465,6 @@ func TestPerCallOptionOverride(t *testing.T) {
 	}
 }
 
-// TestToolProtocolFlagReserved: WithToolProtocol is accepted; the text
-// protocol remains the transport in this release (documented reservation).
-func TestToolProtocolFlagReserved(t *testing.T) {
-	resetScript(t, submitTurn("THOUGHT: done", "done"))
-	agent := newFakeAgent(t,
-		WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
-		WithToolProtocol(),
-	)
-	ans, err := agent.Ask(context.Background(), "task")
-	if err != nil {
-		t.Fatalf("Ask: %v", err)
-	}
-	if ans.ExitStatus != ExitSubmitted {
-		t.Errorf("ExitStatus = %q, want %q", ans.ExitStatus, ExitSubmitted)
-	}
-}
-
 // TestWithHooksCompose: caller hooks observe events after the protocol
 // hooks ran; a caller AfterGenerate sees the appended observation.
 func TestWithHooksCompose(t *testing.T) {
