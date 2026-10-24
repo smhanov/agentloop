@@ -39,13 +39,20 @@ type Hooks struct {
 	// ev.Messages (the appends are permanent transcript entries) and may
 	// set ev.Skip to stop gracefully before querying.
 	BeforeGenerate func(ctx context.Context, ev *Event) error
-	// RebuildContext may observe or replace ev.Context, the exact message
-	// list the model sees this step; ev.Messages is the untouched
-	// transcript. (Reserved; not yet fired.)
+	// RebuildContext fires after BeforeGenerate, before each LLM call:
+	// ev.Messages is the full transcript (read-only) and ev.Context is
+	// pre-seeded to it — the hook may observe or replace ev.Context
+	// wholesale. Replacements are ephemeral: they affect only this call,
+	// while the transcript, Answer.Messages, and Conversation history stay
+	// untouched. Hooks must preserve the trailing assistant tool-call
+	// message and its tool results so the context stays answerable.
 	RebuildContext func(ctx context.Context, ev *Event) error
-	// AfterGenerate fires after each LLM response; it may APPEND to
-	// ev.Messages. In this version the hook is observational: ev.Finish
-	// reports whether the response ended the run, and flips are ignored.
+	// AfterGenerate fires after each LLM response (the assistant message is
+	// already appended); it may APPEND to ev.Messages. Finish arrives
+	// pre-set to "no tool calls"; the hook may flip it either way — false
+	// continues the loop with the appended messages, true stops without
+	// executing the tools. The forced-final step after the tool budget is
+	// spent always finishes, veto or not.
 	AfterGenerate func(ctx context.Context, ev *Event) error
 	// BeforeToolCall fires before each tool call; it may rewrite ev.Args,
 	// and returning ErrSkipToolCall vetoes the execution.
@@ -53,10 +60,10 @@ type Hooks struct {
 	// AfterToolCall fires when a tool execution completes; ev.Result,
 	// ev.Err, and ev.Duration describe the execution.
 	AfterToolCall func(ctx context.Context, ev *Event) error
-	// OnDelta receives streaming answer/reasoning deltas (reserved for
-	// streaming; not yet fired).
-	OnDelta func(ctx context.Context, ev *Event) error
-	// OnDone fires once when the run finishes; ev.Answer is fully
+	// OnDelta receives streaming answer/reasoning deltas (EventAnswerDelta
+	// / EventReasoningDelta distinguishes them) in stream order, in
+	// addition to the AskStream channel.
+	OnDelta func(ctx context.Context, ev *Event) error // OnDone fires once when the run finishes; ev.Answer is fully
 	// populated.
 	OnDone func(ctx context.Context, ev *Event) error
 	// OnError fires once on terminal failure; ev.Err carries the error,
@@ -76,13 +83,13 @@ type Event struct {
 	// AfterGenerate the list is appendable; appends become permanent
 	// transcript entries.
 	Messages []*llmhub.Message
-	// Context is the LLM-visible view for this step (reserved for
-	// RebuildContext).
+	// Context is the LLM-visible view for this step: pre-seeded to the
+	// transcript and replaceable by the RebuildContext hook.
 	Context []*llmhub.Message
 	// Skip requests a graceful stop (BeforeGenerate).
 	Skip bool
-	// Finish reports whether the response ends the run: true when it
-	// carried no tool calls (AfterGenerate).
+	// Finish reports — and may be flipped to change — whether the response
+	// ends the run: true when it carried no tool calls (AfterGenerate).
 	Finish bool
 	// Response is the model response (AfterGenerate).
 	Response *llmhub.Response

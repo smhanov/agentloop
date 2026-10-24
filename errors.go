@@ -16,4 +16,10 @@ var (
 	ErrSkipToolCall = errors.New("agentloop: skip tool call")
 	// ErrNoLLMClient reports that New was called with a nil llmhub client.
 	ErrNoLLMClient = errors.New("agentloop: no LLM client")
+	// ErrConversationBusy reports an Ask or AskStream started on a
+	// Conversation while another turn is still in flight.
+	ErrConversationBusy = errors.New("agentloop: conversation busy")
+	// ErrStreamStale reports a streaming run aborted because no chunk
+	// arrived within the WithStreamWatchdog window.
+	ErrStreamStale = errors.New("agentloop: stream stale")
 )

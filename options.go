@@ -1,6 +1,8 @@
 package agentloop
 
 import (
+	"time"
+
 	"github.com/smhanov/llmhub"
 )
 
@@ -10,6 +12,11 @@ const (
 	// defaultDupCallLimit is how many consecutive identical tool calls are
 	// tolerated before the loop intervenes.
 	defaultDupCallLimit = 3
+	// defaultParallelTools bounds concurrent parallel-eligible executions.
+	defaultParallelTools = 3
+	// defaultStreamWatchdog aborts streams that receive no chunk for this
+	// long.
+	defaultStreamWatchdog = 90 * time.Second
 )
 
 // config holds the resolved settings for an Agent and, layered on top of a
@@ -20,6 +27,8 @@ type config struct {
 	maxToolCalls    int
 	maxSteps        int
 	dupCallLimit    int
+	parallelTools   int
+	streamWatchdog  time.Duration
 	toolChoice      llmhub.ToolChoice
 	generateOptions []llmhub.Option
 	hooks           Hooks
@@ -41,6 +50,15 @@ func (c *config) effectiveMaxSteps() int {
 		return c.maxSteps
 	}
 	return 2*c.effectiveMaxToolCalls() + 2
+}
+
+// effectiveParallelTools returns the concurrency bound for parallel-eligible
+// tool executions.
+func (c *config) effectiveParallelTools() int {
+	if c.parallelTools >= 1 {
+		return c.parallelTools
+	}
+	return defaultParallelTools
 }
 
 // Option configures an Agent at construction time or a single Ask at call
@@ -92,6 +110,29 @@ func WithDupCallLimit(n int) Option {
 	return func(c *config) {
 		if n >= 0 {
 			c.dupCallLimit = n
+		}
+	}
+}
+
+// WithParallelTools bounds concurrent execution of parallel-eligible tool
+// calls (Sequential == false) per step; the default is 3 and 1 forces
+// strictly sequential execution. Values below 1 are ignored, keeping the
+// previous setting.
+func WithParallelTools(n int) Option {
+	return func(c *config) {
+		if n >= 1 {
+			c.parallelTools = n
+		}
+	}
+}
+
+// WithStreamWatchdog aborts AskStream when no stream chunk arrives for d —
+// the Hermes stale-stream pattern; the default is 90s and 0 disables the
+// watchdog. Negative durations are ignored.
+func WithStreamWatchdog(d time.Duration) Option {
+	return func(c *config) {
+		if d >= 0 {
+			c.streamWatchdog = d
 		}
 	}
 }

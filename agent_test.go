@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/smhanov/llmhub"
 )
@@ -48,6 +49,12 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	if ag.cfg.toolChoice.Mode != llmhub.ToolChoiceAuto {
 		t.Errorf("default toolChoice = %v, want auto", ag.cfg.toolChoice.Mode)
 	}
+	if ag.cfg.parallelTools != 3 {
+		t.Errorf("default parallelTools = %d, want 3", ag.cfg.parallelTools)
+	}
+	if ag.cfg.streamWatchdog != 90*time.Second {
+		t.Errorf("default streamWatchdog = %v, want 90s", ag.cfg.streamWatchdog)
+	}
 
 	// Explicit settings apply; MaxSteps defaults off the tool budget.
 	ag = newFakeAgent(t, WithMaxToolCalls(2), WithDupCallLimit(0))
@@ -62,7 +69,7 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	}
 
 	// Values below the minimum are ignored.
-	ag = newFakeAgent(t, WithMaxToolCalls(0), WithMaxSteps(-1), WithDupCallLimit(-2))
+	ag = newFakeAgent(t, WithMaxToolCalls(0), WithMaxSteps(-1), WithDupCallLimit(-2), WithParallelTools(0))
 	if got := ag.cfg.effectiveMaxToolCalls(); got != 5 {
 		t.Errorf("maxToolCalls = %d, want default 5", got)
 	}
@@ -71,6 +78,15 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	}
 	if ag.cfg.dupCallLimit != 3 {
 		t.Errorf("dupCallLimit = %d, want default 3", ag.cfg.dupCallLimit)
+	}
+	if got := ag.cfg.effectiveParallelTools(); got != 3 {
+		t.Errorf("parallelTools = %d, want default 3", got)
+	}
+
+	// The watchdog default can be disabled or shortened explicitly.
+	ag = newFakeAgent(t, WithStreamWatchdog(0))
+	if ag.cfg.streamWatchdog != 0 {
+		t.Errorf("streamWatchdog = %v, want 0 (disabled)", ag.cfg.streamWatchdog)
 	}
 }
 
@@ -630,36 +646,44 @@ func TestOnStartEvent(t *testing.T) {
 	}
 }
 
-func TestAfterGenerateObservational(t *testing.T) {
+func TestAfterGenerateFinishVetoStops(t *testing.T) {
 	resetScript(t,
 		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
-		textTurn("done"),
+		textTurn("never reached"),
 	)
 	var finishes []bool
-	var steps []int
-	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+	ran := false
+	tool := echoTool()
+	tool.Run = func(ctx context.Context, args json.RawMessage) (string, error) {
+		ran = true
+		return "", nil
+	}
+	ag := newFakeAgent(t, WithTools(tool), WithHooks(Hooks{
 		AfterGenerate: func(ctx context.Context, ev *Event) error {
 			finishes = append(finishes, ev.Finish)
-			steps = append(steps, ev.Step)
-			// Flipping Finish must not change the run in this version.
-			ev.Finish = !ev.Finish
+			ev.Finish = true // veto: stop without executing the tools
 			return nil
 		},
 	}))
 
-	ans, err := ag.Ask(context.Background(), "Observe me.")
+	ans, err := ag.Ask(context.Background(), "Veto the tools.")
 	if err != nil {
 		t.Fatalf("Ask: %v", err)
 	}
-	// The tool-call step reported Finish=false, the text step Finish=true.
-	if !reflect.DeepEqual(finishes, []bool{false, true}) {
+	// Finish arrived pre-set to false (tool calls present); the flip stopped
+	// the run before execution.
+	if !reflect.DeepEqual(finishes, []bool{false}) {
 		t.Errorf("finishes = %v", finishes)
 	}
-	if !reflect.DeepEqual(steps, []int{1, 2}) {
-		t.Errorf("steps = %v", steps)
+	if ran {
+		t.Error("tools executed despite a Finish=true veto")
 	}
-	if ans.Steps != 2 || ans.Status != StatusCompleted {
-		t.Errorf("got Steps=%d Status=%v", ans.Steps, ans.Status)
+	if ans.ToolCalls != 0 || len(ans.Tools) != 0 || ans.Steps != 1 || ans.Status != StatusCompleted {
+		t.Errorf("got ToolCalls=%d Tools=%d Steps=%d Status=%v", ans.ToolCalls, len(ans.Tools), ans.Steps, ans.Status)
+	}
+	// The unanswered assistant tool-call message is still in the transcript.
+	if got := len(callsOf(ans.Messages[1])); got != 1 {
+		t.Errorf("transcript tool calls = %d, want 1", got)
 	}
 }
 

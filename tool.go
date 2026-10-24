@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/smhanov/llmhub"
@@ -27,14 +28,13 @@ type Tool struct {
 	// Run executes the tool.
 	Run Handler
 
-	// ConcurrencySafe reports whether concurrent executions of this tool
-	// are safe. Safe tools are eligible for bounded parallel batching and
-	// unsafe tools always execute in strict call order, never overlapping
-	// with anything. The zero value is false (not safe); set it to true for
-	// pure, read-only tools and leave it false for stateful tools (shell
-	// sessions, transactions). Tool dispatch is sequential in this version,
-	// so the flag is advisory.
-	ConcurrencySafe bool
+	// Sequential forces strict call-order execution that never overlaps
+	// with anything (the inverse of dsh's isConcurrencySafe, chosen so the
+	// Go zero value means the common default). Tools with the zero value
+	// are eligible for parallel batching bounded by WithParallelTools; set
+	// Sequential to true for stateful tools (shell sessions,
+	// transactions).
+	Sequential bool
 }
 
 // Observation payloads the loop itself delivers to the model.
@@ -49,8 +49,7 @@ const (
 	// stops gracefully with StatusStopped.
 	stopObservation = `{"warning": "repeated identical call; stopping"}`
 	// budgetObservation is delivered for calls denied because the
-	// MaxToolCalls budget was spent mid-step (several calls in one
-	// response).
+	// MaxToolCalls budget was spent.
 	budgetObservation = `{"error": "tool call budget exhausted"}`
 )
 
@@ -130,34 +129,187 @@ func (r *run) registeredNames() []string {
 	return names
 }
 
-// dispatch resolves one model-requested tool call: it fires BeforeToolCall
-// (veto/rewrite), applies duplicate-call detection and the tool budget,
-// executes the handler, records the trace entry, appends the tool result
-// message, and fires AfterToolCall. It reports stop=true when the
-// duplicate-call limit was exceeded and the run should finish gracefully.
-func (r *run) dispatch(ctx context.Context, step int, call *llmhub.ToolCallContent) (bool, error) {
-	hooks := r.cfg.hooks
+// planMode classifies how a planned tool call will be processed.
+type planMode int
 
-	// Hook: veto or argument rewrite.
-	ev := &Event{Kind: EventBeforeToolCall, Step: step, Call: call, Args: json.RawMessage(call.Arguments)}
-	if err := fire(ctx, hooks.BeforeToolCall, ev); err != nil {
-		if errors.Is(err, ErrSkipToolCall) {
-			r.appendToolResult(call, skippedResult)
-			return false, nil
+const (
+	planExecuteParallel   planMode = iota // batch concurrently, bounded
+	planExecuteSequential                 // run alone, strict call order
+	planResolved                          // observation pre-decided, no execution
+	planStop                              // duplicate limit exceeded: stop run
+)
+
+// callPlan is the phase-A resolution of one model-requested tool call.
+type callPlan struct {
+	mode   planMode
+	call   *llmhub.ToolCallContent
+	args   json.RawMessage
+	tool   Tool
+	warn   bool        // deliver the duplicate-call warning instead of the output
+	result *stepResult // pre-filled for planResolved and planStop
+}
+
+// stepResult is the outcome of processing one planned call: the observation
+// delivered to the model and, when the call did real work, its trace entry.
+type stepResult struct {
+	observation string
+	trace       *ToolResult
+}
+
+// dispatchAll resolves and executes one step's tool calls. Resolution
+// (hooks, duplicate detection, budget, unknown names) happens first, in
+// call order; execution then batches parallel-eligible calls concurrently
+// (bounded by WithParallelTools) while Sequential tools run strictly in
+// call order and never overlap anything. Tool result messages always
+// append in original call order, while AfterToolCall fires in completion
+// order. It reports stopped=true when the duplicate-call limit was
+// exceeded and the run should finish gracefully.
+func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCallContent) (stopped bool, err error) {
+	// Phase A: resolve every call in call order.
+	plans := make([]callPlan, 0, len(calls))
+	for _, call := range calls {
+		plan, err := r.planCall(ctx, step, call)
+		if err != nil {
+			return false, err
 		}
-		return false, fmt.Errorf("agentloop: BeforeToolCall hook: %w", err)
+		plans = append(plans, plan)
+		if plan.mode == planStop {
+			stopped = true
+			break // one repeat too many: trailing calls are ignored
+		}
 	}
-	args := ev.Args
-	if len(args) == 0 {
-		args = json.RawMessage(call.Arguments)
+
+	// Phase B: execute. results[k] is written only by the goroutine that
+	// processes plan k and read only after all of them synchronize, so the
+	// distinct slots need no mutex.
+	results := make([]*stepResult, len(plans))
+	var (
+		mu       sync.Mutex
+		firstErr error
+	)
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	fail := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			cancel() // stop sibling executions that honor ctx
+		}
 	}
+
+	for i := 0; i < len(plans); {
+		switch plan := plans[i]; plan.mode {
+		case planStop, planResolved:
+			results[i] = plan.result
+			if plan.result.trace != nil {
+				// Unknown-name resolution: observers see it like an
+				// execution.
+				ev := &Event{Kind: EventAfterToolCall, Step: step, Call: plan.call, Args: plan.args, Result: plan.result.observation}
+				if err := fire(ctx, r.cfg.hooks.AfterToolCall, ev); err != nil {
+					return false, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
+				}
+				r.emit(ev)
+			}
+			i++
+		case planExecuteSequential:
+			res, err := r.executePlan(wctx, step, plan)
+			if err != nil {
+				return false, err
+			}
+			results[i] = res
+			i++
+		case planExecuteParallel:
+			// Batch the maximal run of consecutive parallel plans.
+			j := i
+			for j < len(plans) && plans[j].mode == planExecuteParallel {
+				j++
+			}
+			bound := r.cfg.effectiveParallelTools()
+			if bound <= 1 || j == i+1 {
+				for k := i; k < j; k++ {
+					res, err := r.executePlan(wctx, step, plans[k])
+					if err != nil {
+						return false, err
+					}
+					results[k] = res
+				}
+				i = j
+				break
+			}
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, bound)
+			for k := i; k < j; k++ {
+				wg.Add(1)
+				go func(k int) {
+					defer wg.Done()
+					select {
+					case sem <- struct{}{}:
+						defer func() { <-sem }()
+					case <-wctx.Done():
+						return
+					}
+					if wctx.Err() != nil {
+						return
+					}
+					res, err := r.executePlan(wctx, step, plans[k])
+					if err != nil {
+						fail(err)
+						return
+					}
+					results[k] = res
+				}(k)
+			}
+			wg.Wait()
+			if firstErr != nil {
+				return false, firstErr
+			}
+			if err := wctx.Err(); err != nil {
+				// Outer cancellation left part of the batch unexecuted.
+				return false, err
+			}
+			i = j
+		}
+	}
+
+	// Append results in original call order regardless of completion order.
+	for k, plan := range plans {
+		res := results[k]
+		if res == nil {
+			continue // aborted before execution; the run is failing anyway
+		}
+		r.appendToolResult(plan.call, res.observation)
+		if res.trace != nil {
+			r.trace = append(r.trace, *res.trace)
+		}
+	}
+	return stopped, nil
+}
+
+// planCall resolves one model-requested tool call: it fires BeforeToolCall
+// (veto/rewrite), applies duplicate-call detection and the tool budget, and
+// classifies the call. Budget accounting (r.executed) is incremented here,
+// in call order, so several calls in one response cannot overspend.
+func (r *run) planCall(ctx context.Context, step int, call *llmhub.ToolCallContent) (callPlan, error) {
+	ev := &Event{Kind: EventBeforeToolCall, Step: step, Call: call, Args: json.RawMessage(call.Arguments)}
+	if err := fire(ctx, r.cfg.hooks.BeforeToolCall, ev); err != nil {
+		if errors.Is(err, ErrSkipToolCall) {
+			return callPlan{mode: planResolved, call: call, result: &stepResult{observation: skippedResult}}, nil
+		}
+		return callPlan{}, fmt.Errorf("agentloop: BeforeToolCall hook: %w", err)
+	}
+	plan := callPlan{call: call}
+	plan.args = ev.Args
+	if len(plan.args) == 0 {
+		plan.args = json.RawMessage(call.Arguments)
+	}
+	r.emit(&Event{Kind: EventBeforeToolCall, Step: step, Call: call, Args: plan.args})
 
 	// Loop detection: identical consecutive (name, args) calls warn at the
 	// limit and stop the run on the next repeat. Any differing call resets
 	// the run.
-	warn := false
 	if r.cfg.dupCallLimit > 0 {
-		key := call.Name + "\x00" + string(args)
+		key := call.Name + "\x00" + string(plan.args)
 		if key == r.dupKey {
 			r.dupCount++
 		} else {
@@ -165,35 +317,49 @@ func (r *run) dispatch(ctx context.Context, step int, call *llmhub.ToolCallConte
 		}
 		switch {
 		case r.dupCount > r.cfg.dupCallLimit:
-			r.appendToolResult(call, stopObservation)
-			return true, nil
+			plan.mode = planStop
+			plan.result = &stepResult{observation: stopObservation}
+			return plan, nil
 		case r.dupCount == r.cfg.dupCallLimit:
-			warn = true
+			plan.warn = true
 		}
 	}
 
 	// Budget: one response may carry more calls than the budget has left.
 	if r.executed >= r.cfg.effectiveMaxToolCalls() {
-		r.appendToolResult(call, budgetObservation)
-		return false, nil
+		plan.mode = planResolved
+		plan.result = &stepResult{observation: budgetObservation}
+		return plan, nil
 	}
 
 	tool, found := r.lookup(call.Name)
 	if !found {
 		observation := unknownToolJSON(suggestName(call.Name, r.registeredNames()))
-		r.executed++
-		r.trace = append(r.trace, ToolResult{Name: call.Name, ID: call.ID, Args: args, Output: observation})
-		r.appendToolResult(call, observation)
-		after := &Event{Kind: EventAfterToolCall, Step: step, Call: call, Args: args, Result: observation}
-		if err := fire(ctx, hooks.AfterToolCall, after); err != nil {
-			return false, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
+		r.executed++ // unknown names count against the budget
+		plan.mode = planResolved
+		plan.result = &stepResult{
+			observation: observation,
+			trace:       &ToolResult{Name: call.Name, ID: call.ID, Args: plan.args, Output: observation},
 		}
-		return false, nil
+		return plan, nil
 	}
+	r.executed++
+	plan.tool = tool
+	if tool.Sequential {
+		plan.mode = planExecuteSequential
+	} else {
+		plan.mode = planExecuteParallel
+	}
+	return plan, nil
+}
 
-	// Execute.
+// executePlan runs one planned call's handler, renders the observation
+// (in-band error or duplicate warning as needed), records the trace entry,
+// and fires AfterToolCall in completion order. Returned errors abort the
+// run: handler context errors and AfterToolCall hook errors.
+func (r *run) executePlan(ctx context.Context, step int, plan callPlan) (*stepResult, error) {
 	start := time.Now()
-	output, handlerErr := tool.Run(ctx, args)
+	output, handlerErr := plan.tool.Run(ctx, plan.args)
 	duration := time.Since(start)
 
 	observation := output
@@ -202,22 +368,23 @@ func (r *run) dispatch(ctx context.Context, step int, call *llmhub.ToolCallConte
 		if errors.Is(handlerErr, context.Canceled) || errors.Is(handlerErr, context.DeadlineExceeded) {
 			// Context errors abort the run; every other handler error is
 			// repaired in-band.
-			return false, handlerErr
+			return nil, handlerErr
 		}
 		observation = errorJSON(handlerErr)
-	case warn:
+	case plan.warn:
 		observation = warningObservation
 	}
 
-	r.executed++
-	r.trace = append(r.trace, ToolResult{Name: call.Name, ID: call.ID, Args: args, Output: observation, Err: handlerErr, Duration: duration})
-	r.appendToolResult(call, observation)
-
-	after := &Event{Kind: EventAfterToolCall, Step: step, Call: call, Args: args, Result: observation, Err: handlerErr, Duration: duration}
-	if err := fire(ctx, hooks.AfterToolCall, after); err != nil {
-		return false, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
+	res := &stepResult{
+		observation: observation,
+		trace:       &ToolResult{Name: plan.call.Name, ID: plan.call.ID, Args: plan.args, Output: observation, Err: handlerErr, Duration: duration},
 	}
-	return false, nil
+	after := &Event{Kind: EventAfterToolCall, Step: step, Call: plan.call, Args: plan.args, Result: observation, Err: handlerErr, Duration: duration}
+	if err := fire(ctx, r.cfg.hooks.AfterToolCall, after); err != nil {
+		return res, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
+	}
+	r.emit(after)
+	return res, nil
 }
 
 // appendToolResult appends the tool result message for call, keeping the

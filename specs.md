@@ -182,7 +182,7 @@ WithSystemPrompt(p string) Option      // prepended as the system message; byte-
 WithTools(t ...Tool) Option            // register tools (replaces set); keep the set small — schemas cost tokens every call
 WithMaxToolCalls(n int) Option         // tool executions allowed per Ask; default 5, min 1 (search preset: 8)
 WithMaxSteps(n int) Option             // hard ceiling on model inferences per Ask; default 2*MaxToolCalls+2
-WithParallelTools(n int) Option        // max concurrent ConcurrencySafe executions per step; default 3; 1 = sequential
+WithParallelTools(n int) Option        // max concurrent parallel-eligible (Sequential == false) executions per step; default 3; 1 = sequential
 WithDupCallLimit(n int) Option         // consecutive identical tool calls before graceful stop; default 3; 0 disables
 WithStreamWatchdog(d time.Duration) Option // abort AskStream when no chunk arrives for d; default 90s; 0 disables
 WithHooks(h Hooks) Option              // hook callbacks (see §5.3)
@@ -210,13 +210,13 @@ type Tool struct {
     Def llmhub.Tool // Name, Description, Parameters (JSON Schema)
     Run Handler
 
-    // ConcurrencySafe reports whether concurrent executions of this tool
-    // are safe (dsh's isConcurrencySafe). Safe tools are batched in
-    // parallel (bounded by WithParallelTools); unsafe tools execute in
-    // strict call order, never overlapping with anything. Default (zero
-    // value) is true — set false for stateful tools (shell sessions,
+    // Sequential forces strict call-order execution that never overlaps
+    // with anything (the inverse of dsh's isConcurrencySafe, chosen so the
+    // Go zero value means the common default). Tools with the zero value
+    // are eligible for parallel batching bounded by WithParallelTools; set
+    // Sequential to true for stateful tools (shell sessions,
     // transactions).
-    ConcurrencySafe bool
+    Sequential bool
 }
 ```
 ```
@@ -234,9 +234,10 @@ type Tool struct {
   repair), else `{"error": "unknown tool"}`; counts against `MaxToolCalls`.
 - **Parallel tool calls** are supported end-to-end: llmhub reassembles
   OpenAI-style parallel argument fragments (`ToolCallContent.Index`), the
-  loop dispatches `ConcurrencySafe` executions concurrently bounded by
-  `WithParallelTools` (default 3; `1` = sequential) while unsafe tools
-  execute strictly in order, `AfterToolCall` fires as each execution
+  loop dispatches parallel-eligible (`Sequential: false`) executions
+  concurrently bounded by `WithParallelTools` (default 3; `1` = sequential)
+  while `Sequential: true` tools execute strictly in order, never
+  overlapping with anything, `AfterToolCall` fires as each execution
   completes, and tool result messages are appended in **original call
   order** regardless of completion order.
 - **Loop detection** (ZeroClaw): `WithDupCallLimit(n)` (default 3, 0

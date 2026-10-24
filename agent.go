@@ -27,9 +27,11 @@ func New(llm *llmhub.Client, opts ...Option) (*Agent, error) {
 		return nil, fmt.Errorf("agentloop: %w", ErrNoLLMClient)
 	}
 	cfg := config{
-		maxToolCalls: defaultMaxToolCalls,
-		dupCallLimit: defaultDupCallLimit,
-		toolChoice:   llmhub.AutoToolChoice(),
+		maxToolCalls:   defaultMaxToolCalls,
+		dupCallLimit:   defaultDupCallLimit,
+		parallelTools:  defaultParallelTools,
+		streamWatchdog: defaultStreamWatchdog,
+		toolChoice:     llmhub.AutoToolChoice(),
 	}
 	applyOptions(&cfg, opts)
 	return &Agent{llm: llm, cfg: cfg}, nil
@@ -48,12 +50,36 @@ func MustNew(llm *llmhub.Client, opts ...Option) *Agent {
 // trace. opts override the Agent's construction options for this call only;
 // they are applied after the constructor options, so later options win.
 func (a *Agent) Ask(ctx context.Context, query string, opts ...Option) (*Answer, error) {
+	cfg := a.cfg
+	applyOptions(&cfg, opts)
+	return a.ask(ctx, query, cfg, nil)
+}
+
+// AskStream is Ask with streaming, mirroring llmhub's streaming semantics:
+// underlying llmhub Stream chunks are forwarded as they arrive — reasoning
+// deltas (EventReasoningDelta) and content deltas (EventAnswerDelta) from
+// EVERY step, each tagged with Step. Deltas from steps that end in tool
+// calls are interim model commentary — streamed for live UIs but excluded
+// from the final Answer.Text, which is the final step's text. Every delta
+// event carries an llmhub Timing snapshot; Done carries the complete set.
+// Intermediate tool/step events are also delivered so CLI/UI consumers see
+// progress. The channel closes after Done or Error; consumers must drain it
+// until close. A run that receives no stream chunk for the
+// WithStreamWatchdog window aborts with ErrStreamStale.
+func (a *Agent) AskStream(ctx context.Context, query string, opts ...Option) (<-chan Event, error) {
+	cfg := a.cfg
+	applyOptions(&cfg, opts)
+	return a.askStream(ctx, query, cfg, nil)
+}
+
+// ask runs one query with an optional conversation prefix.
+func (a *Agent) ask(ctx context.Context, query string, cfg config, prefix []*llmhub.Message) (*Answer, error) {
 	if query == "" {
 		return nil, fmt.Errorf("agentloop: %w: query is empty", ErrInvalidInput)
 	}
-	cfg := a.cfg
-	applyOptions(&cfg, opts)
-	return newRun(cfg).execute(ctx, a.llm, query)
+	run := newRun(cfg)
+	run.prefix = prefix
+	return run.execute(ctx, a.llm, query)
 }
 
 // applyOptions applies opts in order, skipping nil entries.
