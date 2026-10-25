@@ -1,18 +1,47 @@
 # agentloop
 
-A small Go library for building LLM agents with tools, hooks, skills, and
-ready-made presets. agentloop runs the loop every agent needs — send a
-prompt to the model, execute the tool calls it requests, feed the results
-back, repeat until it produces a final answer — and makes every step of
-that loop observable and configurable. It ships with two presets assembled
-entirely from the public core: a **search agent** grounded in Serper web
-search, and a **bash coding agent** protocol-compatible with
-[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent).
+<div align="center">
 
-All LLM access goes through
-[`github.com/smhanov/llmhub`](https://github.com/smhanov/llmhub), so
-agentloop works with OpenAI, Anthropic, Gemini, Ollama, xAI, OpenRouter,
-Z.AI, or your own provider without ever talking to a vendor API directly.
+**Everything you need for building an agent.**
+
+[![CI](https://github.com/smhanov/agentloop/actions/workflows/ci.yml/badge.svg)](https://github.com/smhanov/agentloop/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/smhanov/agentloop.svg)](https://pkg.go.dev/github.com/smhanov/agentloop)
+[![Go Report Card](https://goreportcard.com/badge/github.com/smhanov/agentloop)](https://goreportcard.com/report/github.com/smhanov/agentloop)
+[![Go](https://img.shields.io/badge/go-1.21%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+</div>
+
+agentloop is a Go library
+that takes care of everything you don't want to think about right now —
+the loop every agent needs (send a prompt to the model, execute the tool
+calls it requests, feed the results back, repeat until it produces a
+final answer), plus the budgets, hooks, skills, and tracing around it —
+so you can just build your agent. Every step of the loop is observable
+and configurable.
+
+It uses its sister project
+[`github.com/smhanov/llmhub`](https://github.com/smhanov/llmhub) so you
+can plug into any LLM — OpenAI, Anthropic, Gemini, Ollama, xAI,
+OpenRouter, Z.AI, or your own provider — without ever talking to a
+vendor API directly.
+
+Two pre-configured agents are included as reference examples, each
+assembled entirely from the public core:
+
+- a **search agent** that uses [serper](https://serper.dev) web search
+  to answer multi-step queries, with inline citations
+- a **coding agent**, based on
+  [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent), that
+  solves tasks by executing shell commands in a workspace
+
+**Going deeper.** If you want the full picture of how agents work —
+the tool-calling loop, budgets, streaming, skills, and how to build
+them all from first principles — read the author's book,
+[*Building AI Agents from Scratch*](https://stevehanov.ca/books/building-ai-agents-from-scratch.pdf).
+It is the in-depth companion to this library: agentloop is the
+distillation of the techniques it teaches, with the scaffolding
+already written for you.
 
 ## Why agentloop?
 
@@ -44,6 +73,9 @@ go get github.com/smhanov/agentloop
 Go 1.21 or newer. The only dependency is llmhub; the search preset also
 wants a [serper.dev](https://serper.dev) API key at runtime (never at
 build time).
+
+The full API reference — every exported type, option, and hook — lives
+on [pkg.go.dev](https://pkg.go.dev/github.com/smhanov/agentloop).
 
 ## Quick Start
 
@@ -194,6 +226,11 @@ call the two numberings are identical.
 
 ## Where to go next
 
+- [API reference](https://pkg.go.dev/github.com/smhanov/agentloop) —
+  godoc for every exported symbol
+- [Building AI Agents from Scratch](https://stevehanov.ca/books/building-ai-agents-from-scratch.pdf)
+  — the author's book: an in-depth, from-first-principles guide to
+  writing agents, and the ideas behind this library
 - [Building an agent](#building-an-agent) — the core API and every option
 - [Writing tools](#writing-tools) — plain and stateful tools, error handling
 - [Hooks](#hooks) — the full hook and event reference
@@ -1007,6 +1044,23 @@ CI, along with `gofmt -l`, `go vet ./...`, and two policy tests: an
 exported-API budget (the library keeps a deliberately small surface —
 the test fails when exported symbols grow past a fixed ceiling) and a
 repo hygiene scan (the repository stays domain-neutral).
+
+## Versioning and stability
+
+Releases follow [semantic versioning](https://semver.org) and the module
+path is stable: `go get -u github.com/smhanov/agentloop` always moves
+you forward safely. While the project is pre-v1, the minor version is
+the breaking-change signal; after v1, breaking changes only ever cross a
+major version.
+
+Two project rules keep upgrades boring:
+
+- **A deliberately small API surface.** The exported API is under a
+  fixed budget enforced by a test in CI — new symbols must earn their
+  place, so the surface you compile against stays lean (see
+  [Testing](#testing)).
+- **A supported Go version window.** The minimum is Go 1.21; each new
+  Go release is adopted once CI proves the suite against it.
 
 ## Contributing
 
