@@ -588,7 +588,9 @@ result's full page when snippets are insufficient.
 
 **Sources.** `search.Answer` embeds the core answer plus `Sources`: every
 `web_search` result from the trace, deduped by URL in first-seen order,
-with `Fetched: true` marking pages the model read in full. The default
+with `Fetched: true` marking pages the model read in full; a page fetched
+by a URL no search returned is appended after them, also marked `Fetched`.
+The default
 prompt instructs the model to cite inline as `[n]` by first-seen order, so
 `[n]` in the text aligns with `Sources[n-1]` — exactly when one search
 returned the sources; across several searches the global dedupe order can

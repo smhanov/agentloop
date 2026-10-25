@@ -428,58 +428,81 @@ func (a *Agent) Agent() *agentloop.Agent { return a.agent }
 type Answer struct {
 	*agentloop.Answer
 	// Sources lists the web_search results from the trace, marking entries
-	// the model also fetched in full.
+	// the model also fetched in full, plus fetch-only pages appended last.
 	Sources []Source
 }
 
-// Sources extracts sources from any core Answer's web_search tool results,
-// deduped by URL in first-seen order, marking entries whose URL the model
-// also passed to a successful fetch_page. It is a pure function over the
-// trace — usable on search.Answer and directly on EventDone payloads from
-// streaming runs.
+// Sources extracts sources from any core Answer's tool trace: every
+// web_search result, deduped by URL in first-seen order, plus any page the
+// model read in full through fetch_page whose URL no search returned —
+// appended after the search-derived sources in fetch order, with Fetched
+// set and no Snippet (the fetch payload carries none). Entries whose URL
+// the model also passed to a successful fetch_page are marked Fetched,
+// whenever the fetch happened relative to the search. Failed fetches
+// (error observations) and unreadable payloads add nothing. It is a pure
+// function over the trace — usable on search.Answer and directly on
+// EventDone payloads from streaming runs.
 func Sources(ans *agentloop.Answer) []Source {
 	if ans == nil {
 		return nil
 	}
 	var out []Source
 	seen := make(map[string]bool)
+	// Pass 1: search-derived sources, first-seen dedup.
 	for _, tr := range ans.Tools {
-		switch tr.Name {
-		case searchToolName:
-			var payload searchPayload
-			if json.Unmarshal([]byte(tr.Output), &payload) != nil {
-				continue // error observation, not a result payload
-			}
-			for _, r := range payload.Results {
-				if r.Link != "" {
-					if seen[r.Link] {
-						continue
-					}
-					seen[r.Link] = true
+		if tr.Name != searchToolName {
+			continue
+		}
+		var payload searchPayload
+		if json.Unmarshal([]byte(tr.Output), &payload) != nil {
+			continue // error observation, not a result payload
+		}
+		for _, r := range payload.Results {
+			if r.Link != "" {
+				if seen[r.Link] {
+					continue
 				}
-				out = append(out, Source{
-					Title: r.Title, URL: r.Link, Snippet: r.Snippet, Date: r.Date, Publisher: r.Publisher,
-				})
+				seen[r.Link] = true
 			}
-		case fetchToolName:
-			var args struct {
-				URL string `json:"url"`
-			}
-			if json.Unmarshal(tr.Args, &args) != nil || args.URL == "" || tr.Err != nil {
-				continue
-			}
-			var obs struct {
-				Error string `json:"error"`
-			}
-			if json.Unmarshal([]byte(tr.Output), &obs) == nil && obs.Error != "" {
-				continue // the fetch failed; the page was never read
-			}
+			out = append(out, Source{
+				Title: r.Title, URL: r.Link, Snippet: r.Snippet, Date: r.Date, Publisher: r.Publisher,
+			})
+		}
+	}
+	// Pass 2: fetch_page results, after every search-derived source is
+	// known. A successful fetch of an already-present URL marks it Fetched;
+	// the rest append as fetch-only sources in fetch order, so pages the
+	// model actually read are never invisible to consumers.
+	for _, tr := range ans.Tools {
+		if tr.Name != fetchToolName {
+			continue
+		}
+		var args struct {
+			URL string `json:"url"`
+		}
+		if json.Unmarshal(tr.Args, &args) != nil || args.URL == "" || tr.Err != nil {
+			continue
+		}
+		var obs struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal([]byte(tr.Output), &obs) == nil && obs.Error != "" {
+			continue // the fetch failed; the page was never read
+		}
+		var payload fetchPayload
+		if json.Unmarshal([]byte(tr.Output), &payload) != nil {
+			continue // unreadable output; the page's identity is unknown
+		}
+		if seen[args.URL] {
 			for i := range out {
 				if out[i].URL == args.URL {
 					out[i].Fetched = true
 				}
 			}
+			continue
 		}
+		seen[args.URL] = true
+		out = append(out, Source{Title: payload.Title, URL: args.URL, Fetched: true})
 	}
 	return out
 }

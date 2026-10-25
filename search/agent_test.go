@@ -21,6 +21,7 @@ const (
 	urlA = "https://a.example/1"
 	urlB = "https://b.example/2"
 	urlC = "https://c.example/3"
+	urlD = "https://d.example/4"
 )
 
 func TestSourcesFromTrace(t *testing.T) {
@@ -65,6 +66,60 @@ func TestSourcesFromTrace(t *testing.T) {
 	}
 	if got := Sources(&agentloop.Answer{}); got != nil {
 		t.Errorf("Sources(empty) = %v, want nil", got)
+	}
+}
+
+func TestSourcesFetchOnlyVisibility(t *testing.T) {
+	ans := &agentloop.Answer{Tools: []agentloop.ToolResult{
+		// A fetch-only page read before any search still appends last.
+		{Name: fetchToolName, Args: json.RawMessage(`{"url":"` + urlD + `"}`),
+			Output: `{"url":"` + urlD + `","title":"Delta","text":"early text"}`},
+		{Name: searchToolName, Output: `{"results":[
+			{"title":"Alpha","link":"` + urlA + `","snippet":"first"},
+			{"title":"Beta","link":"` + urlB + `","snippet":"second"}]}`},
+		{Name: fetchToolName, Args: json.RawMessage(`{"url":"` + urlC + `"}`),
+			Output: `{"url":"` + urlC + `","title":"Gamma","text":"full text"}`},
+		// Fetching an already-seen URL marks it without duplicating.
+		{Name: fetchToolName, Args: json.RawMessage(`{"url":"` + urlA + `"}`),
+			Output: `{"url":"` + urlA + `","title":"Alpha","text":"full"}`},
+		// Failed and malformed fetches add nothing.
+		{Name: fetchToolName, Args: json.RawMessage(`{"url":"https://gone.example/x"}`),
+			Output: `{"error":"fetch failed: 404"}`,
+			Err:    fmt.Errorf("fetch failed: 404")},
+		{Name: fetchToolName, Args: json.RawMessage(`{"url":"https://raw.example/y"}`),
+			Output: `not json`},
+	}}
+
+	sources := Sources(ans)
+	if len(sources) != 4 {
+		t.Fatalf("got %d sources, want 4: %+v", len(sources), sources)
+	}
+	// Search-derived sources keep first-seen order; fetch-only pages append
+	// after them in fetch order.
+	for i, want := range []string{urlA, urlB, urlD, urlC} {
+		if sources[i].URL != want {
+			t.Errorf("sources[%d].URL = %q, want %q", i, sources[i].URL, want)
+		}
+	}
+	// Fetch-only entries carry the payload's title and Fetched, and none of
+	// the search-only fields.
+	for i, wantTitle := range []string{"Delta", "Gamma"} {
+		s := sources[2+i]
+		if !s.Fetched {
+			t.Errorf("sources[%d] fetched page not marked: %+v", 2+i, s)
+		}
+		if s.Title != wantTitle {
+			t.Errorf("sources[%d].Title = %q, want %q", 2+i, s.Title, wantTitle)
+		}
+		if s.Snippet != "" || s.Date != "" || s.Publisher != "" {
+			t.Errorf("sources[%d] carries search-only fields: %+v", 2+i, s)
+		}
+	}
+	if !sources[0].Fetched {
+		t.Errorf("already-seen URL re-fetched but not marked Fetched: %+v", sources[0])
+	}
+	if sources[1].Fetched {
+		t.Errorf("unfetched source marked Fetched: %+v", sources[1])
 	}
 }
 
