@@ -206,17 +206,20 @@ func (r *run) infer(ctx context.Context, llm *llmhub.Client, context []*llmhub.M
 // tools' schemas come first (so caller-supplied llmhub options can still
 // override them), then the configured defaults, plus the tool-choice
 // policy, with NoToolChoice appended when the budget forces a final
-// answer. The slice is copied so concurrent runs never share backing
-// arrays.
+// answer. Tool schemas and tool choice are only sent when tools are
+// registered — several OpenAI-compatible servers (vLLM included) reject
+// tool_choice without tools. The slice is copied so concurrent runs never
+// share backing arrays.
 func (r *run) generateOptions(forceFinal bool) []llmhub.Option {
 	opts := make([]llmhub.Option, 0, len(r.cfg.tools)+len(r.cfg.generateOptions)+2)
-	if len(r.cfg.tools) > 0 {
-		defs := make([]llmhub.Tool, len(r.cfg.tools))
-		for i, tool := range r.cfg.tools {
-			defs[i] = tool.Def
-		}
-		opts = append(opts, llmhub.WithTools(defs...))
+	if len(r.cfg.tools) == 0 {
+		return append(opts, r.cfg.generateOptions...)
 	}
+	defs := make([]llmhub.Tool, len(r.cfg.tools))
+	for i, tool := range r.cfg.tools {
+		defs[i] = tool.Def
+	}
+	opts = append(opts, llmhub.WithTools(defs...))
 	opts = append(opts, r.cfg.generateOptions...)
 	choice := r.cfg.toolChoice
 	if choice.Mode == "" {

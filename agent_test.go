@@ -108,6 +108,19 @@ func TestAskNoTools(t *testing.T) {
 		t.Error("Timing = nil, want client telemetry")
 	}
 
+	// No tool schemas or tool-choice policy may reach the provider when no
+	// tools are registered: OpenAI-compatible servers (vLLM) reject
+	// tool_choice without tools with a 400.
+	fakeState.mu.Lock()
+	cfg := fakeState.requests[0].config
+	fakeState.mu.Unlock()
+	if len(cfg.Tools) != 0 {
+		t.Errorf("advertised tools = %+v, want none", cfg.Tools)
+	}
+	if cfg.ToolChoice != nil {
+		t.Errorf("tool choice sent without tools: %+v", *cfg.ToolChoice)
+	}
+
 	// Transcript: system, user, assistant.
 	wantRoles := []llmhub.Role{llmhub.RoleSystem, llmhub.RoleUser, llmhub.RoleAssistant}
 	if !reflect.DeepEqual(rolesOf(ans.Messages), wantRoles) {
@@ -131,8 +144,8 @@ func TestAskNoTools(t *testing.T) {
 	if got := textOf(reqs[0].prompt[1]); got != "What is the meaning of life?" {
 		t.Errorf("prompt user = %q", got)
 	}
-	if reqs[0].config.ToolChoice == nil || reqs[0].config.ToolChoice.Mode != llmhub.ToolChoiceAuto {
-		t.Errorf("tool choice = %+v, want auto", reqs[0].config.ToolChoice)
+	if reqs[0].config.ToolChoice != nil {
+		t.Errorf("tool choice = %+v, want none (no tools registered)", *reqs[0].config.ToolChoice)
 	}
 }
 
