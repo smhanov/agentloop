@@ -183,6 +183,15 @@ func TestAskSingleToolCall(t *testing.T) {
 		t.Errorf("Args = %s", tr.Args)
 	}
 
+	// The registered tool schema is advertised to the provider on every
+	// inference.
+	fakeState.mu.Lock()
+	advertised := fakeState.requests[0].config.Tools
+	fakeState.mu.Unlock()
+	if len(advertised) != 1 || advertised[0].Name != "echo" {
+		t.Errorf("advertised tools = %+v, want [echo]", advertised)
+	}
+
 	// The second inference saw the assistant call and its result.
 	reqs := fakeRequests()
 	if len(reqs) != 2 {

@@ -43,9 +43,10 @@ func callTurn(calls ...*llmhub.ToolCallContent) fakeTurn {
 	return fakeTurn{calls: calls}
 }
 
-// fakeRequest records the exact prompt the model saw.
+// fakeRequest records the exact prompt and merged config the model saw.
 type fakeRequest struct {
 	prompt []*llmhub.Message
+	config llmhub.Config
 }
 
 // fakeHarness replays fakeState.script and records every request.
@@ -71,7 +72,7 @@ type fakeProvider struct{}
 func (fakeProvider) Name() string { return "fake" }
 
 func (fakeProvider) Generate(ctx context.Context, prompt []*llmhub.Message, opts ...llmhub.Option) (*llmhub.Response, error) {
-	turn, err := fakeState.next(ctx, prompt)
+	turn, err := fakeState.next(ctx, prompt, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +87,7 @@ func (fakeProvider) Generate(ctx context.Context, prompt []*llmhub.Message, opts
 }
 
 func (fakeProvider) Stream(ctx context.Context, prompt []*llmhub.Message, opts ...llmhub.Option) (<-chan llmhub.StreamChunk, error) {
-	turn, err := fakeState.next(ctx, prompt)
+	turn, err := fakeState.next(ctx, prompt, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -103,13 +104,16 @@ func (fakeProvider) Stream(ctx context.Context, prompt []*llmhub.Message, opts .
 }
 
 // next pops the next scripted turn and records the request.
-func (h *fakeHarness) next(ctx context.Context, prompt []*llmhub.Message) (fakeTurn, error) {
+func (h *fakeHarness) next(ctx context.Context, prompt []*llmhub.Message, opts ...llmhub.Option) (fakeTurn, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return fakeTurn{}, err
 	}
-	h.requests = append(h.requests, fakeRequest{prompt: snapshotMessages(prompt)})
+	h.requests = append(h.requests, fakeRequest{
+		prompt: snapshotMessages(prompt),
+		config: llmhub.NewConfig(opts...),
+	})
 	if h.index >= len(h.script) {
 		return fakeTurn{}, fmt.Errorf("fake provider: script exhausted at request %d", h.index+1)
 	}

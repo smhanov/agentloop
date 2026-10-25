@@ -173,12 +173,21 @@ func (r *run) infer(ctx context.Context, llm *llmhub.Client, context []*llmhub.M
 	return r.streamInfer(ctx, llm, context, opts)
 }
 
-// generateOptions builds the per-call llmhub options: the configured
-// defaults plus the tool-choice policy, with NoToolChoice appended when the
-// budget forces a final answer. The slice is copied so concurrent runs
-// never share backing arrays.
+// generateOptions builds the per-call llmhub options: the registered
+// tools' schemas come first (so caller-supplied llmhub options can still
+// override them), then the configured defaults, plus the tool-choice
+// policy, with NoToolChoice appended when the budget forces a final
+// answer. The slice is copied so concurrent runs never share backing
+// arrays.
 func (r *run) generateOptions(forceFinal bool) []llmhub.Option {
-	opts := make([]llmhub.Option, 0, len(r.cfg.generateOptions)+2)
+	opts := make([]llmhub.Option, 0, len(r.cfg.tools)+len(r.cfg.generateOptions)+2)
+	if len(r.cfg.tools) > 0 {
+		defs := make([]llmhub.Tool, len(r.cfg.tools))
+		for i, tool := range r.cfg.tools {
+			defs[i] = tool.Def
+		}
+		opts = append(opts, llmhub.WithTools(defs...))
+	}
 	opts = append(opts, r.cfg.generateOptions...)
 	choice := r.cfg.toolChoice
 	if choice.Mode == "" {

@@ -131,7 +131,9 @@ func WithOutputLimit(n int) Option {
 // and the per-command observation layout. Empty strings keep the
 // corresponding default. Task templates receive Task, SubmitMarker, GOOS,
 // GOARCH, Hostname, and IsDarwin; observation templates receive Exception,
-// ReturnCode, Output, TooLong, Head, Tail, and Elided.
+// ReturnCode, Output, TooLong, Head, Tail, and Elided. The system template
+// renders once at construction — a system override only takes effect when
+// passed to New, while task and observation overrides also work per Ask.
 func WithTemplates(system, task, observation string) Option {
 	return agentloop.WithSetting(settingTemplates, templateOverrides{
 		system: system, task: task, observation: observation,
@@ -154,9 +156,10 @@ func WithApprover(fn func(ctx context.Context, command string) error) Option {
 // statuses are identical to the text protocol's; the run ends naturally
 // when the model stops calling tools, or with ExitSubmitted once a
 // command's output announces the submit marker. The format-error machinery
-// is a text-protocol concept and does not run in tool mode. The preset owns
-// the registered tool set in this mode: core WithTools options passed
-// alongside are overridden.
+// is a text-protocol concept and does not run in tool mode. The bash tool
+// is registered per Ask alongside the construction-time tool set (skills'
+// skill_read, caller tools); a per-Ask core WithTools option is still
+// overridden by the preset's merged set.
 func WithToolProtocol() Option {
 	return agentloop.WithSetting(settingToolProtocol, true)
 }
@@ -285,7 +288,11 @@ type Agent struct {
 // until the task is submitted or a limit is hit. The default protocol is
 // mini-swe-agent's text-action protocol. Core options passed in opts
 // (budgets, skills, …) apply after the preset defaults, so later options
-// win; the preset itself owns the system prompt and the hard step ceiling.
+// win. The preset renders its system template once here (it depends only
+// on runtime constants, never on the task) and the core appends the skills
+// catalog to it, so agentloop.WithSkills composes with the preset; a
+// WithSystemPrompt option later in opts overrides the rendered template.
+// The preset also owns the hard step ceiling.
 func New(llm *llmhub.Client, opts ...Option) (*Agent, error) {
 	cfg := resolvePreset(opts)
 	sys := newSystemData()
@@ -349,8 +356,7 @@ type Answer struct {
 // run executes one task: resolve the effective configuration, render the
 // task prompt, wire the protocol hooks, and run the core loop.
 func (a *Agent) run(ctx context.Context, task string, opts ...Option) (*agentloop.Answer, *runState, error) {
-	merged := append(append([]Option(nil), a.opts...), opts...)
-	extras, st, err := a.prepare(merged, task)
+	extras, st, err := a.prepare(opts, task)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -364,8 +370,7 @@ func (a *Agent) run(ctx context.Context, task string, opts ...Option) (*agentloo
 // runStream is run for streaming; it shares all wiring and differs only in
 // the core entry point.
 func (a *Agent) runStream(ctx context.Context, task string, opts ...Option) (<-chan agentloop.Event, error) {
-	merged := append(append([]Option(nil), a.opts...), opts...)
-	extras, _, err := a.prepare(merged, task)
+	extras, _, err := a.prepare(opts, task)
 	if err != nil {
 		return nil, err
 	}
@@ -373,15 +378,25 @@ func (a *Agent) runStream(ctx context.Context, task string, opts ...Option) (<-c
 }
 
 // runExtras is what prepare hands to the core call: the rendered query and
-// the options appended after the merged list.
+// the options for this Ask.
 type runExtras struct {
 	query string
 	opts  []Option
 }
 
-// prepare resolves the effective preset config from the merged option
-// list, renders the task prompt, and builds the protocol hook set.
-func (a *Agent) prepare(merged []Option, task string) (runExtras, *runState, error) {
+// prepare wires one Ask. The merged option list (construction options
+// first, this Ask's options last) resolves the preset settings, so every
+// preset option can be overridden per Ask. The core, however, only sees
+// this Ask's options: the construction-time core options — the rendered
+// system prompt with the skills catalog, the registered tools, budgets —
+// are already frozen into the inner agent, and re-applying them here would
+// replace that resolved state instead of composing with it (the core's
+// WithSystemPrompt/WithTools replace, they never merge). The task text
+// stays in the first user message via the task template; the system
+// template depends only on runtime constants, so nothing needs re-rendering
+// per Ask.
+func (a *Agent) prepare(perAsk []Option, task string) (runExtras, *runState, error) {
+	merged := append(append([]Option(nil), a.opts...), perAsk...)
 	cfg := resolvePreset(merged)
 	st := &runState{start: time.Now()}
 	p, err := newProtocol(cfg, st)
@@ -403,30 +418,28 @@ func (a *Agent) prepare(merged []Option, task string) (runExtras, *runState, err
 		BeforeGenerate: p.beforeGenerate,
 		AfterGenerate:  p.afterGenerate,
 	}
-	coreOpts := append([]Option(nil), merged...)
+	coreOpts := append([]Option(nil), perAsk...)
 	if cfg.toolProtocol {
 		// Tool protocol: the native bash tool replaces the text-protocol
 		// AfterGenerate hook — only the limits' step/cost counter stays.
 		// Termination is the loop's natural one (the model stops calling
-		// tools), and the preset owns the registered tool set.
+		// tools). The handler closes over this run's protocol state, so the
+		// tool is re-registered per Ask — merged with the construction-time
+		// tool set (skills' skill_read, caller tools) into ONE WithTools,
+		// because the core's WithTools replaces the whole set. Per-Ask
+		// caller WithTools options are applied first and overridden.
 		hooks.AfterGenerate = p.countStep
-		coreOpts = append(coreOpts, agentloop.WithTools(agentloop.Tool{
+		tools := append(a.agent.Tools(), agentloop.Tool{
 			Def:        bashToolDef(cfg.submitMarker),
 			Run:        p.handleToolCall,
 			Sequential: true, // one stateful shell: strict call order, no overlap
-		}))
+		})
+		coreOpts = append(coreOpts, agentloop.WithTools(tools...))
 	}
 	if user, ok := agentloop.Settings(merged...)[settingHooks].(agentloop.Hooks); ok {
 		hooks = composeHooks(hooks, user)
 	}
-	systemPrompt, err := renderSystem(cfg.systemTemplate, a.sys)
-	if err != nil {
-		return runExtras{}, nil, err
-	}
-	coreOpts = append(coreOpts,
-		agentloop.WithSystemPrompt(systemPrompt),
-		agentloop.WithHooks(hooks),
-	)
+	coreOpts = append(coreOpts, agentloop.WithHooks(hooks))
 	if ceiling := hardStepCeiling(cfg.stepLimit); ceiling > 0 {
 		coreOpts = append(coreOpts, agentloop.WithMaxSteps(ceiling))
 	}

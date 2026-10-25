@@ -49,6 +49,17 @@ func MustNew(llm *llmhub.Client, opts ...Option) *Agent {
 	return agent
 }
 
+// Tools returns the Agent's registered tools in registration order — the
+// construction-time set, with skills resolved. The result is a copy;
+// mutating it affects no Agent. Presets use it to re-issue one merged
+// WithTools for an Ask (the core's WithTools replaces the set, it never
+// merges).
+func (a *Agent) Tools() []Tool {
+	out := make([]Tool, len(a.cfg.tools))
+	copy(out, a.cfg.tools)
+	return out
+}
+
 // Ask runs the loop to completion for one user query and returns the full
 // trace. opts override the Agent's construction options for this call only;
 // they are applied after the constructor options, so later options win.
