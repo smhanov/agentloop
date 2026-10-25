@@ -63,6 +63,12 @@ already written for you.
 - **Transparent traces.** Every `Ask` returns the final text plus the
   complete trace: every tool execution with output and duration, the full
   message transcript, and token/cost usage.
+- **Plain Go, tiny footprint.** One dependency, one static binary:
+  agents compile with `CGO_ENABLED=0 go build` to any `GOOS`/`GOARCH`
+  and run in about 7 MB of RAM — no Python environment, no Node
+  sidecar, no container to babysit. Embed an agent in a CLI, a cron
+  job, an existing Go service, or a Raspberry Pi; between model calls
+  the loop itself is nearly free.
 
 ## Installation
 
