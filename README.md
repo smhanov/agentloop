@@ -374,10 +374,17 @@ Multiple limit dimensions always apply at once, so no run can run away:
 
 - **Tool budget** — `WithMaxToolCalls` (default 5; the search preset
   raises it to 8). When the budget is spent, the loop forces a final
-  answer by sending the next inference with `llmhub.NoToolChoice()`. If
-  the model still returns tool calls on that step, none are executed and
-  the step's text finishes the run — the loop can never spin forever,
-  not even under a vetoing hook.
+  answer by sending the next inference with `llmhub.NoToolChoice()`. It
+  also appends a one-time user message to the transcript telling the
+  model the budget is exhausted and it must answer the original question
+  now — synthesize the evidence already gathered, state plainly anything
+  that could not be determined, and do not narrate further plans. The
+  notice lands after the last tool result, appears in
+  `Answer.Messages`, and is idempotent if forced steps repeat. Without
+  it, models tend to spend the forced step narrating their next search
+  instead of answering. If the model still returns tool calls on that
+  step, none are executed and the step's text finishes the run — the
+  loop can never spin forever, not even under a vetoing hook.
 - **Step ceiling** — `WithMaxSteps` (default `2*MaxToolCalls+2`). A hard
   ceiling on model inferences; exceeding it returns `ErrBudgetExhausted`
   with `Answer.Status = StatusBudgetExhausted` (partial trace included).

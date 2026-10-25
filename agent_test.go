@@ -432,6 +432,129 @@ func TestAskBudgetForcesNoToolChoice(t *testing.T) {
 	}
 }
 
+func TestAskBudgetForcesFinalNotice(t *testing.T) {
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		callTurn(llmhub.ToolCall("c2", "echo", `{}`)),
+		textTurn("Synthesis of the gathered evidence."),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()), WithMaxToolCalls(2))
+
+	ans, err := ag.Ask(context.Background(), "Answer from the evidence.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusCompleted || ans.Steps != 3 || ans.ToolCalls != 2 {
+		t.Fatalf("got Status=%v Steps=%d ToolCalls=%d", ans.Status, ans.Steps, ans.ToolCalls)
+	}
+
+	// The notice is one user message between the last tool result and the
+	// forced final response.
+	wantRoles := []llmhub.Role{
+		llmhub.RoleUser, llmhub.RoleAssistant, llmhub.RoleTool,
+		llmhub.RoleAssistant, llmhub.RoleTool,
+		llmhub.RoleUser, llmhub.RoleAssistant,
+	}
+	if !reflect.DeepEqual(rolesOf(ans.Messages), wantRoles) {
+		t.Fatalf("roles = %v, want %v", rolesOf(ans.Messages), wantRoles)
+	}
+	if got := textOf(ans.Messages[5]); got != forcedFinalNotice {
+		t.Errorf("notice message = %q, want the budget-exhaustion instruction", got)
+	}
+
+	// The notice covers every instruction the contract promises.
+	for _, want := range []string{
+		"budget", "exhausted",
+		"answer the user's original question now",
+		"evidence already gathered",
+		"synthesize",
+		"could not be determined",
+		"do not narrate further research plans",
+	} {
+		if !strings.Contains(strings.ToLower(forcedFinalNotice), want) {
+			t.Errorf("notice missing instruction %q: %s", want, forcedFinalNotice)
+		}
+	}
+
+	// The first two inferences saw no notice; the forced one ended with it
+	// and still carried NoToolChoice.
+	reqs := fakeRequests()
+	if len(reqs) != 3 {
+		t.Fatalf("got %d provider requests, want 3", len(reqs))
+	}
+	for i := 0; i < 2; i++ {
+		for _, m := range reqs[i].prompt {
+			if textOf(m) == forcedFinalNotice {
+				t.Errorf("request %d already carried the notice", i+1)
+			}
+		}
+		if reqs[i].config.ToolChoice == nil || reqs[i].config.ToolChoice.Mode != llmhub.ToolChoiceAuto {
+			t.Errorf("request %d tool choice = %+v, want auto", i+1, reqs[i].config.ToolChoice)
+		}
+	}
+	last := reqs[2].prompt
+	if n := len(last); n == 0 || last[n-1].Role != llmhub.RoleUser || textOf(last[n-1]) != forcedFinalNotice {
+		t.Errorf("forced prompt does not end with the notice (last role %v)", rolesOf(last[max(n-1, 0):]))
+	}
+	if reqs[2].config.ToolChoice == nil || reqs[2].config.ToolChoice.Mode != llmhub.ToolChoiceNone {
+		t.Errorf("forced call tool choice = %+v, want none", reqs[2].config.ToolChoice)
+	}
+}
+
+func TestAskFinalNoticeAppendedOnce(t *testing.T) {
+	// A vetoed text-only forced step re-enters the forced path; the notice
+	// must not duplicate. MaxSteps (2*1+2) leaves room for both forced
+	// steps, so the run still completes instead of hitting the ceiling.
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		textTurn("Let me outline my next steps."),
+		textTurn("Final synthesis of the evidence."),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()), WithMaxToolCalls(1), WithHooks(Hooks{
+		AfterGenerate: func(ctx context.Context, ev *Event) error {
+			if ev.Step == 2 {
+				ev.Finish = false // force a second forced step
+			}
+			return nil
+		},
+	}))
+
+	ans, err := ag.Ask(context.Background(), "One call only.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusCompleted || ans.Steps != 3 {
+		t.Fatalf("got Status=%v Steps=%d, want Completed/3", ans.Status, ans.Steps)
+	}
+	notices := 0
+	for _, m := range ans.Messages {
+		if textOf(m) == forcedFinalNotice {
+			notices++
+		}
+	}
+	if notices != 1 {
+		t.Fatalf("transcript carries %d notice messages, want 1", notices)
+	}
+
+	// Both forced inferences saw the single notice; the second was not
+	// re-appended after the vetoed step's response.
+	reqs := fakeRequests()
+	if len(reqs) != 3 {
+		t.Fatalf("got %d provider requests, want 3", len(reqs))
+	}
+	for i := 1; i <= 2; i++ {
+		n := 0
+		for _, m := range reqs[i].prompt {
+			if textOf(m) == forcedFinalNotice {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("request %d carried the notice %d times, want 1", i+1, n)
+		}
+	}
+}
+
 func TestAskForcedFinalSkipsToolCalls(t *testing.T) {
 	resetScript(t,
 		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
@@ -449,9 +572,14 @@ func TestAskForcedFinalSkipsToolCalls(t *testing.T) {
 	if ans.Text != "giving up" {
 		t.Errorf("Text = %q", ans.Text)
 	}
-	// The forced step's tool call was not executed: no result for c2.
-	if got := len(ans.Messages); got != 4 {
-		t.Fatalf("messages = %d, want 4", got)
+	// The forced step's tool call was not executed: no result for c2. The
+	// transcript grew by the budget-exhaustion notice (a documented change):
+	// user, assistant call, tool result, notice, forced response.
+	if got := len(ans.Messages); got != 5 {
+		t.Fatalf("messages = %d, want 5", got)
+	}
+	if got := textOf(ans.Messages[3]); got != forcedFinalNotice {
+		t.Errorf("notice = %q, want the budget-exhaustion instruction", got)
 	}
 	for _, tr := range ans.Tools {
 		if tr.ID == "c2" {

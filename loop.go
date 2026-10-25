@@ -8,6 +8,22 @@ import (
 	"github.com/smhanov/llmhub"
 )
 
+// forcedFinalNotice is the budget-exhaustion instruction appended to the
+// transcript exactly once, immediately before the first forced-final
+// inference. Until it arrives, the transcript's last entry is a tool result
+// and the model has no signal that no further tools will be available —
+// providers honor a fresh user-role instruction far better than
+// tool-choice alone, so without it models keep narrating their interim
+// plan (their next searches) instead of answering from what they found.
+// The wording is domain-neutral and instructs synthesis of the gathered
+// evidence, plain statements of anything undetermined, and no further plan
+// narration.
+const forcedFinalNotice = "The tool budget for this run is exhausted: no further tool calls will be executed. " +
+	"Answer the user's original question now, using only the evidence already gathered in this conversation. " +
+	"Synthesize your findings into a complete final answer, and state plainly anything that could not be determined. " +
+	"Do not narrate further research plans, do not say what you would check next, and do not ask permission — " +
+	"produce the final answer the user will read."
+
 // run holds the mutable state of a single Ask or AskStream. A run is used
 // by one goroutine (plus short-lived dispatch workers that only touch
 // their own result slots).
@@ -28,6 +44,7 @@ type run struct {
 	trace      []ToolResult
 	dupKey     string // (name, args) key of the current consecutive run
 	dupCount   int    // length of the current consecutive identical-call run
+	notice     bool   // the forced-final notice is already in the transcript
 }
 
 // newRun initializes per-run state from a resolved config.
@@ -89,6 +106,18 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 		// Once the tool budget is spent, force a final answer by disabling
 		// tools for this call.
 		forceFinal := r.executed >= r.cfg.effectiveMaxToolCalls()
+
+		// On the first forced step, tell the model the situation changed:
+		// the budget is spent and it must answer from the evidence already
+		// gathered. The notice rides a user message appended AFTER the last
+		// tool result and BEFORE the forced inference — the transcript
+		// stays append-only and honestly records the instruction. A vetoed
+		// text-only forced step re-enters this path; the guard keeps the
+		// notice single.
+		if forceFinal && !r.notice {
+			r.notice = true
+			r.transcript = append(r.transcript, llmhub.NewUserMessage(llmhub.Text(forcedFinalNotice)))
+		}
 
 		// Hook: observe or replace the exact context the model sees. The
 		// transcript itself is never mutated by this hook.

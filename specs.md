@@ -390,7 +390,10 @@ Loop algorithm:
    via `ev.Args`), execute concurrently (bounded 3), fire `AfterToolCall`
    per call, append tool result messages in order, loop to 2.
 7. Budget: when `MaxToolCalls` is reached, subsequent `Generate` calls use
-   `WithToolChoice(llmhub.NoToolChoice())` to force a final answer; if the
+   `WithToolChoice(llmhub.NoToolChoice())` to force a final answer, and one
+   user-role notice is appended once (after the last tool result, before
+   the forced inference) instructing the model to synthesize the gathered
+   evidence now and state plainly anything undetermined; if the
    model still returns tool calls, execute none and finish with
    `resp.Text()` — the loop can never spin forever. `MaxSteps` exceeded →
    `Status = StatusBudgetExhausted` returned as `ErrBudgetExhausted`

@@ -300,6 +300,57 @@ func TestToolProtocolTextFinishCompleted(t *testing.T) {
 	}
 }
 
+// TestToolProtocolForcedFinalNotice: a tool-protocol run that spends the
+// core's default five-command budget reaches the forced-final step. The
+// core appends its budget-exhaustion instruction once as a user message
+// after the last tool result (inert for the protocol: observations ride
+// tool results, and the parser only ever reads assistant text), and the
+// forced step's text ends the run through the natural path — StatusCompleted
+// with no preset exit status.
+func TestToolProtocolForcedFinalNotice(t *testing.T) {
+	resetScript(t,
+		toolCallTurn("c1", "echo one"),
+		toolCallTurn("c2", "echo two"),
+		toolCallTurn("c3", "echo three"),
+		toolCallTurn("c4", "echo four"),
+		toolCallTurn("c5", "echo five"),
+		textTurn("All five commands ran; final summary."),
+	)
+	agent := newFakeAgent(t,
+		WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
+		WithToolProtocol(),
+	)
+
+	ans, err := agent.Ask(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != agentloop.StatusCompleted || ans.ExitStatus != "" {
+		t.Fatalf("Status = %v ExitStatus = %q; want natural Completed termination", ans.Status, ans.ExitStatus)
+	}
+	if ans.Steps != 6 || ans.ToolCalls != 5 {
+		t.Fatalf("Steps = %d ToolCalls = %d; want 6/5", ans.Steps, ans.ToolCalls)
+	}
+
+	// Exactly one user-role notice, after the last tool result and before
+	// the forced final response.
+	notices := 0
+	for i, m := range ans.Messages {
+		if m.Role == llmhub.RoleUser && strings.Contains(textOf(m), "tool budget for this run is exhausted") {
+			notices++
+			if ans.Messages[i-1].Role != llmhub.RoleTool {
+				t.Errorf("notice at %d not preceded by the last tool result", i)
+			}
+			if i != len(ans.Messages)-2 {
+				t.Errorf("notice at %d does not sit right before the final response", i)
+			}
+		}
+	}
+	if notices != 1 {
+		t.Errorf("transcript carries %d budget-exhaustion notices, want 1", notices)
+	}
+}
+
 // TestToolProtocolSwitchesTransport: with WithToolProtocol a text-protocol
 // response is not parsed at all — no format error, no execution; the run
 // completes the moment the model stops calling tools. (The default remains
