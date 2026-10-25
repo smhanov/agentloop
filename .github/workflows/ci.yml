@@ -1,0 +1,41 @@
+# CI for agentloop. Formatting, vet, and the full test suite (which
+# includes the exported-API budget test and the repo hygiene scan) run on
+# every push and pull request. Live-tagged tests (build tag `live`, which
+# call real providers and search backends) are excluded by default — they
+# are never run here because no secrets are available to CI.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go test -race
+        run: go test -race ./...

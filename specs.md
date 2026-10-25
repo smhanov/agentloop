@@ -1150,8 +1150,8 @@ All offline tests run without network (`go test ./...`).
    `MaxSteps` ceiling; usage summation; ctx cancellation mid-tool;
    hook-error abort; per-call options override; **parallel tools** —
    randomized completion delays prove result messages append in call order
-   while `AfterToolCall` fires in completion order, `ConcurrencySafe=false`
-   tools execute strictly in order amid safe ones, and
+   while `AfterToolCall` fires in completion order, `Sequential=true`
+   tools execute strictly in order amid parallel-eligible ones, and
    `WithParallelTools(1)` executes sequentially; **loop detection** —
    dup-call warning at the limit, graceful `StatusStopped` on the next
    repeat, counter resets on any differing call; **stream watchdog** —
@@ -1461,7 +1461,7 @@ this itself — domain guidance travels with the query, never the agent).
      the reference sections.
   2. **Complete reference (below):** core API — building an agent
      (`New`, options table); writing tools (§5.7 clock example, plus a
-     stateful `ConcurrencySafe=false` example); the hooks reference table
+     stateful `Sequential: true` example); the hooks reference table
      with every hook point and `Event` field; budgets & loop safety;
      streaming (llmhub parity, watchdog); conversations (multi-turn,
      prompt-cache guidance); skills (folder layout, L0–L3 explanation,
@@ -1539,7 +1539,7 @@ to this spec's choices:
 | §2 steering/inbox seam (steer/inject/cancel) | `BeforeGenerate` message-append + ctx cancel (§5.5) |
 | §2 loop shape 5: event-log projection (dsh `deriveMessages`) | append-only transcript + `RebuildContext` projection hook (§5.3) — the LLM context is derived, never mutated |
 | §4 overflow → compress + retry; compression is the sanctioned prefix mutation | `RebuildContext` hook: deterministic compression of older steps, trailing tool-call/result pair preserved (§5.3) |
-| §3 ToolDefinition/ToolSchema split; `isConcurrencySafe` batching | `Tool{Def, Run, ConcurrencySafe}` (§5.2) |
+| §3 ToolDefinition/ToolSchema split; `isConcurrencySafe` batching | `Tool{Def, Run, Sequential}` (§5.2) |
 | §3 guarded execution / approval gates | `WithApprover` on the bash preset; blocking `BeforeToolCall` sanctioned (§5.3, §8.1) |
 | §3 malformed-call repair in-band (Levenshtein names, error results) | §5.2 — tool errors and unknown-name suggestions are tool results, never hard fails |
 | §3 one-tool counter-case (mini) | bash preset ships exactly one `bash` tool (§8) |
