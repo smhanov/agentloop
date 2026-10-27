@@ -659,6 +659,33 @@ while Unicode Tags (U+E0001–U+E007F) and bidi overrides are stripped
 before validation — when stripping changed anything the skill loads and
 an advisory `SkillIssue` ("unicode steganography stripped") is recorded.
 
+**Diagnosing dropped skills.** The issues the loader recorded stay
+observable after construction: `Agent.SkillIssues()` returns every
+`SkillIssue` from the construction-time scan, in scan order, as one
+snapshot copy (nil when no skills were configured) — a headless consumer
+learns why a skill is missing without re-implementing the scan. A
+`SkillIssue` carries `Dir` (the skill folder the issue refers to, or the
+scan root itself), `Name` (the skill folder name; empty only for issues
+about the scan root), and a stable `Reason` string: `"bad frontmatter"`,
+`"missing SKILL.md"`, `"unreadable SKILL.md"`, `"name mismatch"`,
+`"invalid name"`, `"empty description"`, `"description too long"`,
+`"empty body"`, `"NUL byte"`, `"unicode steganography stripped"`,
+`"duplicate skill"`, `"skill folder, not a skills root (pass its parent
+directory)"`, or `"unreadable directory"`:
+
+```go
+ag, err := agentloop.New(llm, agentloop.WithSkills("path/to/skills-root"))
+if err != nil {
+    return err // only a permission-denied root fails construction
+}
+for _, issue := range ag.SkillIssues() {
+    log.Printf("dropped skill %s (%s): %s", issue.Name, issue.Dir, issue.Reason)
+}
+```
+
+Both presets forward `WithSkills` to the core unchanged, so the same
+issues are reachable through their wrapped agent's `SkillIssues()`.
+
 Skill loads are ordinary tool calls: they appear in `Answer.Tools`, in
 traces, and in `AfterToolCall` hooks like any other execution.
 

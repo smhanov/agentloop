@@ -145,6 +145,18 @@ func snippetConversations(agent *agentloop.Agent) {
 	_, _ = second, err
 }
 
+// README: Skills (diagnosing dropped skills).
+func snippetSkillIssues(llm *llmhub.Client) error {
+	ag, err := agentloop.New(llm, agentloop.WithSkills("path/to/skills-root"))
+	if err != nil {
+		return err // only a permission-denied root fails construction
+	}
+	for _, issue := range ag.SkillIssues() {
+		log.Printf("dropped skill %s (%s): %s", issue.Name, issue.Dir, issue.Reason)
+	}
+	return nil
+}
+
 // README: The search agent (custom backends — proves the interface shapes).
 type cachingSearcher struct{}
 

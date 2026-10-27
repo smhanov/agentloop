@@ -441,7 +441,9 @@ func escapesDir(rel string) bool {
 // folders — in precedence order (the first occurrence of a name wins).
 // Passing a skill folder itself instead of a root is fail-closed like any
 // other invalid input: it is reported as a SkillIssue by LoadSkills, and
-// construction proceeds without it. This is a construction-time option:
+// construction proceeds without it. The recorded issues stay observable
+// afterwards through Agent.SkillIssues (see the README's Skills section,
+// "Diagnosing dropped skills"). This is a construction-time option:
 // New consumes the directories once, appends the byte-stable
 // "## Skills" catalog section to the system prompt, and registers the
 // skill_read tool; passing it to Ask or AskStream has no effect. A scan
@@ -464,19 +466,21 @@ func WithPinnedSkills(names ...string) Option {
 }
 
 // resolveSkills performs the construction-time skill wiring: loading,
-// catalog and pinned-body rendering, and skill_read registration. New
-// calls it once, after all options have applied, so option order never
-// matters and the rendered prompt is frozen for the Agent's lifetime.
-func resolveSkills(c *config) error {
+// catalog and pinned-body rendering, and skill_read registration. It
+// returns the issues LoadSkills recorded, for observability through
+// Agent.SkillIssues. New calls it once, after all options have applied, so
+// option order never matters and the rendered prompt is frozen for the
+// Agent's lifetime.
+func resolveSkills(c *config) ([]SkillIssue, error) {
 	if len(c.skillDirs) == 0 && len(c.pinnedNames) == 0 {
-		return nil
+		return nil, nil
 	}
-	skills, _, err := LoadSkills(c.skillDirs...)
+	skills, issues, err := LoadSkills(c.skillDirs...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(c.pinnedNames) > maxPinnedSkills {
-		return fmt.Errorf("agentloop: %w: %d pinned skill names (at most %d)",
+		return nil, fmt.Errorf("agentloop: %w: %d pinned skill names (at most %d)",
 			ErrTooManyPinnedSkills, len(c.pinnedNames), maxPinnedSkills)
 	}
 	byName := make(map[string]*Skill, len(skills))
@@ -491,7 +495,7 @@ func resolveSkills(c *config) error {
 		}
 		skill, ok := byName[name]
 		if !ok {
-			return fmt.Errorf("agentloop: %w: pinned skill %q is not among the loaded skills",
+			return nil, fmt.Errorf("agentloop: %w: pinned skill %q is not among the loaded skills",
 				ErrInvalidInput, name)
 		}
 		pinnedSeen[name] = true
@@ -506,7 +510,7 @@ func resolveSkills(c *config) error {
 	if len(skills) > 0 {
 		c.tools = append(c.tools, newSkillReadTool(skills))
 	}
-	return nil
+	return issues, nil
 }
 
 // joinPromptSection appends a rendered section to the system prompt,

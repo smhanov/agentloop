@@ -1105,6 +1105,92 @@ func TestSkillLoadEndToEnd(t *testing.T) {
 	}
 }
 
+// TestAgentSkillIssues pins the SkillIssues accessor: the issues
+// LoadSkills recorded during construction are observable on the Agent in
+// scan order, a mis-shaped skills root surfaces exactly the root-shape
+// issue, a healthy pack yields none, the returned slice is a snapshot,
+// and neither per-call options nor mutating the snapshot can change what
+// the Agent holds.
+func TestAgentSkillIssues(t *testing.T) {
+	misplaced := filepath.Join(skillTree(t, map[string]string{
+		"misplaced/SKILL.md": skillMD("misplaced", "Use when misplaced.", "Body."),
+	}), "misplaced")
+
+	t.Run("no skills configured is nil", func(t *testing.T) {
+		agent := newFakeAgent(t)
+		if got := agent.SkillIssues(); got != nil {
+			t.Fatalf("SkillIssues() = %+v, want nil without WithSkills", got)
+		}
+	})
+
+	t.Run("healthy pack has no issues", func(t *testing.T) {
+		root := skillTree(t, map[string]string{
+			"alpha/SKILL.md": skillMD("alpha", "Use when alpha.", "Alpha body."),
+		})
+		agent := newFakeAgent(t, WithSkills(root))
+		if got := agent.SkillIssues(); len(got) != 0 {
+			t.Fatalf("SkillIssues() = %+v, want none for a healthy pack", got)
+		}
+	})
+
+	t.Run("mis-shaped root surfaces exactly the root-shape issue", func(t *testing.T) {
+		agent := newFakeAgent(t, WithSkills(misplaced))
+		issues := agent.SkillIssues()
+		if len(issues) != 1 {
+			t.Fatalf("issues = %+v, want exactly 1 (no child-scan issues)", issues)
+		}
+		if want := "skill folder, not a skills root (pass its parent directory)"; issues[0].Reason != want {
+			t.Fatalf("Reason = %q, want the stable %q", issues[0].Reason, want)
+		}
+		if issues[0].Name != "misplaced" {
+			t.Fatalf("Name = %q, want the folder name", issues[0].Name)
+		}
+		if issues[0].Dir != misplaced {
+			t.Fatalf("Dir = %q, want the folder itself %q", issues[0].Dir, misplaced)
+		}
+	})
+
+	t.Run("issues surface in scan order", func(t *testing.T) {
+		root := skillTree(t, map[string]string{
+			"broken/SKILL.md": "just markdown, no frontmatter\n",
+		})
+		agent := newFakeAgent(t, WithSkills(misplaced, root))
+		issues := agent.SkillIssues()
+		if len(issues) != 2 {
+			t.Fatalf("issues = %+v, want one per root in scan order", issues)
+		}
+		if issues[0].Reason != issueNotSkillsRoot || issues[0].Name != "misplaced" {
+			t.Fatalf("first issue = %+v, want the mis-shaped root's", issues[0])
+		}
+		if issues[1].Reason != issueBadFrontmatter || issues[1].Name != "broken" {
+			t.Fatalf("second issue = %+v, want the broken child's", issues[1])
+		}
+	})
+
+	t.Run("returned slice is a snapshot", func(t *testing.T) {
+		agent := newFakeAgent(t, WithSkills(misplaced))
+		snapshot := agent.SkillIssues()
+		snapshot[0].Reason = "tampered"
+		snapshot[0].Name = "tampered"
+		fresh := agent.SkillIssues()
+		if fresh[0].Reason != issueNotSkillsRoot || fresh[0].Name != "misplaced" {
+			t.Fatalf("mutating the snapshot changed the Agent's issues: %+v", fresh[0])
+		}
+	})
+
+	t.Run("per-call options do not clear it", func(t *testing.T) {
+		agent := newFakeAgent(t, WithSkills(misplaced))
+		resetScript(t, textTurn("done"))
+		if _, err := agent.Ask(context.Background(), "go", WithMaxToolCalls(1)); err != nil {
+			t.Fatal(err)
+		}
+		got := agent.SkillIssues()
+		if len(got) != 1 || got[0].Reason != issueNotSkillsRoot || got[0].Name != "misplaced" {
+			t.Fatalf("SkillIssues() after Ask with options = %+v, want the construction issues", got)
+		}
+	})
+}
+
 // roleNames renders roles for easy comparison.
 func roleNames(roles []llmhub.Role) []string {
 	names := make([]string, 0, len(roles))

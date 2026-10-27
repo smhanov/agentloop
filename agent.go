@@ -17,6 +17,10 @@ import (
 type Agent struct {
 	llm *llmhub.Client
 	cfg config
+	// skillIssues is what resolveSkills recorded at construction, frozen
+	// here (not on cfg) so per-call options can never mutate it. See
+	// SkillIssues.
+	skillIssues []SkillIssue
 }
 
 // New creates a general-purpose agent over the given llmhub client with no
@@ -34,10 +38,11 @@ func New(llm *llmhub.Client, opts ...Option) (*Agent, error) {
 		toolChoice:     llmhub.AutoToolChoice(),
 	}
 	applyOptions(&cfg, opts)
-	if err := resolveSkills(&cfg); err != nil {
+	skillIssues, err := resolveSkills(&cfg)
+	if err != nil {
 		return nil, err
 	}
-	return &Agent{llm: llm, cfg: cfg}, nil
+	return &Agent{llm: llm, cfg: cfg, skillIssues: skillIssues}, nil
 }
 
 // MustNew is like New but panics on error (for examples and tests).
@@ -57,6 +62,24 @@ func MustNew(llm *llmhub.Client, opts ...Option) *Agent {
 func (a *Agent) Tools() []Tool {
 	out := make([]Tool, len(a.cfg.tools))
 	copy(out, a.cfg.tools)
+	return out
+}
+
+// SkillIssues returns the issues skill loading recorded at construction:
+// every SkillIssue LoadSkills produced while resolving WithSkills, in
+// scan order. Loading is fail-closed — issues never fail construction
+// (only an unreadable scan root does) and never change the catalog — so
+// this accessor is how a headless consumer learns why a skill is missing
+// without re-running the scan. The result is a snapshot copy; mutating it
+// affects no Agent. It is nil when no skills were configured. Both
+// presets forward WithSkills to New unchanged, so the same issues are
+// reachable through their wrapped core Agent.
+func (a *Agent) SkillIssues() []SkillIssue {
+	if len(a.skillIssues) == 0 {
+		return nil
+	}
+	out := make([]SkillIssue, len(a.skillIssues))
+	copy(out, a.skillIssues)
 	return out
 }
 
