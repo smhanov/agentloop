@@ -17,7 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Skill-file conventions and validation limits (specs.md §5.8).
+// Skill-file conventions and validation limits.
 const (
 	// skillFileName is the required marker file inside a skill folder.
 	skillFileName = "SKILL.md"

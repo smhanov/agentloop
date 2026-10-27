@@ -9,10 +9,10 @@ import (
 )
 
 // agentloop is a domain-neutral library, and the public repository keeps
-// it that way (specs.md §15): no financial, stock, or trading terminology
-// in any committed file — README, doc comments, identifiers, tests,
-// testdata, or examples. This test walks every git-tracked file and fails
-// when a forbidden term appears outside the allowlist below. Like the
+// it that way: no financial, stock, or trading terminology in any
+// committed file — README, doc comments, identifiers, tests, testdata, or
+// examples. This test walks every git-tracked file and fails when a
+// forbidden term appears outside the allowlist below. Like the
 // exported-API budget, it turns a documentation promise into a gate.
 //
 // The scan is substring-based and case-insensitive, so it deliberately
@@ -42,11 +42,6 @@ var allowedHits = map[string]string{
 	"apibudget_test.go":   "term list of the guard tests themselves",
 	"hygiene_test.go":     "term list of the guard tests themselves",
 	"bash/prompt_test.go": "template-neutrality check's own term list",
-	// The internal design specification documents the local-only test
-	// corpus (its §14), which by the same repo rule never enters the
-	// published documentation; the file is the one place the corpus may be
-	// written down and is maintained out-of-band of the shipped surface.
-	"specs.md": "internal design doc; its local-corpus section",
 }
 
 // trackedFiles returns the repository's git-tracked files (with a plain

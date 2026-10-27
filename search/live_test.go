@@ -1,6 +1,6 @@
 //go:build live
 
-// Live smoke tests (specs.md §12.10–§12.11): a real model via the z.ai
+// Live smoke tests: a real model via the z.ai
 // coding endpoint plus real Serper search. They never run in the default
 // suite or CI — the `live` build tag excludes them — and they do not
 // count against the default suite's time budget. Run them explicitly:
@@ -23,7 +23,7 @@ import (
 	"github.com/smhanov/llmhub"
 
 	// The zai provider registers itself on import; this is the default
-	// live configuration of specs.md §12.11.
+	// live configuration.
 	_ "github.com/smhanov/llmhub/providers/zai"
 )
 
@@ -153,7 +153,7 @@ func TestLiveFetchChain(t *testing.T) {
 // question answerable entirely from static knowledge: the loop must
 // finish in a single step with zero tool calls. The local corpus carries
 // the domain-bearing counterpart of this control; the committed file
-// stays generic (specs.md §15).
+// stays generic.
 func TestLiveZeroToolControl(t *testing.T) {
 	skipUnlessLive(t)
 	ctx, cancel := liveContext(t)

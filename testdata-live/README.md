@@ -1,15 +1,14 @@
 # testdata-live — local live-test corpus
 
 This directory holds the **local, never-committed prompt corpus** used to
-exercise agentloop against a real model and real search results. Its
-content is derived from the internal design spec (`specs.md` §14), which
-is the single source of truth for the corpus text. Everything here except
-this README is gitignored: `.gitignore` excludes `/testdata-live/*` and
-re-admits only this README.
+exercise agentloop against a real model and real search results. The
+corpus text is maintained locally, out-of-band of the shipped repository:
+everything here except this README is gitignored — `.gitignore` excludes
+`/testdata-live/*` and re-admits only this README.
 
 ## Why the split exists
 
-The shipped repository is domain-neutral (`specs.md` §15): no committed
+The shipped repository stays domain-neutral: no committed
 file — source, tests, testdata, docs — may contain corpus terminology.
 The acceptance corpus nevertheless stresses everything a search agent
 must do: time-sensitive facts, structured JSON output, multi-entity
@@ -35,7 +34,7 @@ tension:
 `manifest.json` records, for every prompt file: its `category`, the
 production prompt it mirrors (`mirror`), `live` or `offline` (`live` =
 requires real search; `offline` = loop-behavior control answerable
-without tools), and the `pass` criteria from `specs.md` §14.
+without tools), and the `pass` criteria for judging a run.
 
 ## Running the corpus manually
 
@@ -55,7 +54,7 @@ manifest entries need no search key.
 ## Running the live test suite
 
 The `search` package carries an opt-in live smoke suite behind the build
-tag `live` (`specs.md` §12.10): three structural tests — a current-facts
+tag `live`: three structural tests — a current-facts
 question, a search→fetch chain, and a zero-tool control — run against a
 real model plus real search. It is excluded from the default suite and
 from CI, and does not count against the default suite's time budget:
@@ -74,6 +73,7 @@ clear message; without the tag the file is not compiled at all.
 - Never write key material into prompt files, `manifest.json`, captured
   run output, or plans; refer to `ZAI_API_KEY` / `SERPER_API_KEY` by
   name only.
-- New corpus entries start in `specs.md` §14 (source of truth), then land
-  here as prompt file + manifest entry, with a genericized loop-shape
-  equivalent added to the relevant package's committed tests.
+- New corpus entries are drafted locally in this directory (prompt file +
+  manifest entry, with pass criteria in the manifest), and a genericized
+  loop-shape equivalent is added to the relevant package's committed
+  tests.

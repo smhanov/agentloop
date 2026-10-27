@@ -10,8 +10,8 @@ import (
 	"testing"
 )
 
-// The library's architecture promise (specs.md §11) is a small exported
-// surface: one core package plus two presets, and nothing else. This test
+// The library's architecture promise is a small exported surface: one
+// core package plus two presets, and nothing else. This test
 // enforces that promise the way gptme's `arewetiny` does — it counts the
 // exported symbols of every shipped library package and fails once the
 // count crosses a fixed ceiling. Adding public API must be a deliberate
