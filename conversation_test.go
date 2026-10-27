@@ -2,8 +2,10 @@ package agentloop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/smhanov/llmhub"
@@ -299,4 +301,241 @@ func TestConversationBudgetExhaustedTurnStillRemembers(t *testing.T) {
 	if !reflect.DeepEqual(roles, want) {
 		t.Errorf("history roles = %v, want %v", roles, want)
 	}
+}
+
+// TestConversationFailedTurnJoinsHistory: a transport error after one
+// complete tool pair no longer erases the turn — the failed turn joins the
+// history, closed by the abort notice, and the error still returns.
+func TestConversationFailedTurnJoinsHistory(t *testing.T) {
+	boom := errors.New("connection reset mid-run")
+	first := callTurn(llmhub.ToolCall("c1", "echo", `{}`))
+	first.usage = llmhub.UsageMetadata{TotalTokens: 7}
+	resetScript(t, first, fakeTurn{err: boom})
+	conv := newFakeAgent(t, WithTools(echoTool())).Conversation()
+
+	ans, err := conv.Ask(context.Background(), "q1")
+	if !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want boom", err)
+	}
+	if ans == nil || ans.Status != StatusFailed {
+		t.Fatalf("Answer = %+v, want StatusFailed", ans)
+	}
+	// The completed pair survives and the notice closes the turn: user,
+	// assistant call, real tool result, abort notice.
+	roles := rolesOf(conv.Messages())
+	want := []llmhub.Role{
+		llmhub.RoleUser, llmhub.RoleAssistant, llmhub.RoleTool, llmhub.RoleUser,
+	}
+	if !reflect.DeepEqual(roles, want) {
+		t.Errorf("history roles = %v, want %v", roles, want)
+	}
+	notice := textOf(conv.Messages()[3])
+	if !strings.Contains(notice, "The previous attempt failed before completing") ||
+		!strings.Contains(notice, "The turn was aborted") ||
+		!strings.Contains(notice, boom.Error()) {
+		t.Errorf("abort notice = %q", notice)
+	}
+	// The answer carries the same partial turn, plus the run's work so far.
+	if !equalMessages(ans.Messages, conv.Messages()) {
+		t.Errorf("Answer.Messages do not match the remembered turn")
+	}
+	if ans.Steps != 1 || ans.ToolCalls != 1 {
+		t.Errorf("Steps = %d, ToolCalls = %d, want 1/1", ans.Steps, ans.ToolCalls)
+	}
+	// The failed turn's usage folded into the total with everything else.
+	if got := conv.TotalUsage(); got.TotalTokens != 7 {
+		t.Errorf("TotalUsage = %+v, want the failed turn's usage", got)
+	}
+}
+
+// TestConversationAbortedToolCallsSynthesized: a failure that strands
+// unanswered tool calls (here a BeforeToolCall hook error before execution)
+// leaves one synthesized error result per pending call, so the remembered
+// turn is provider-valid.
+func TestConversationAbortedToolCallsSynthesized(t *testing.T) {
+	boom := errors.New("hook exploded")
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		callTurn(
+			llmhub.ToolCall("c2", "echo", `{"n":2}`),
+			llmhub.ToolCall("c3", "echo", `{"n":3}`),
+		),
+		textTurn("unreachable"),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+		BeforeToolCall: func(ctx context.Context, ev *Event) error {
+			if ev.Step == 2 { // step 1 completes its pair; step 2 strands both calls
+				return boom
+			}
+			return nil
+		},
+	}))
+	conv := ag.Conversation()
+
+	ans, err := conv.Ask(context.Background(), "q1")
+	if !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want boom", err)
+	}
+	if ans == nil || ans.Status != StatusFailed {
+		t.Fatalf("Answer = %+v, want StatusFailed", ans)
+	}
+	// user, completed pair, dangling assistant call, one synthesized result
+	// per pending call, then the notice.
+	msgs := conv.Messages()
+	wantRoles := []llmhub.Role{
+		llmhub.RoleUser, llmhub.RoleAssistant, llmhub.RoleTool,
+		llmhub.RoleAssistant, llmhub.RoleTool, llmhub.RoleTool, llmhub.RoleUser,
+	}
+	if !reflect.DeepEqual(rolesOf(msgs), wantRoles) {
+		t.Fatalf("history roles = %v, want %v", rolesOf(msgs), wantRoles)
+	}
+	for i, id := range []string{"c2", "c3"} {
+		synth := msgs[4+i]
+		if got := synth.Meta["tool_call_id"]; got != id {
+			t.Errorf("synthesized result %d call id = %q, want %q", i, got, id)
+		}
+		got := textOf(synth)
+		if !strings.HasPrefix(got, "error: run aborted before execution:") || !strings.Contains(got, boom.Error()) {
+			t.Errorf("synthesized result %d = %q", i, got)
+		}
+	}
+	if got := conv.Messages()[6].Meta["tool_call_id"]; got != "" {
+		t.Errorf("notice carries tool metadata: %q", got)
+	}
+}
+
+// TestConversationFailedTurnBeforeInference: a transport error before any
+// inference still records the turn — the query plus the abort notice.
+func TestConversationFailedTurnBeforeInference(t *testing.T) {
+	boom := errors.New("connection refused")
+	resetScript(t, fakeTurn{err: boom})
+	conv := newFakeAgent(t, WithTools(echoTool()), WithSystemPrompt("sys")).Conversation()
+
+	ans, err := conv.Ask(context.Background(), "q1")
+	if !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want boom", err)
+	}
+	if ans == nil || ans.Status != StatusFailed {
+		t.Fatalf("Answer = %+v, want StatusFailed", ans)
+	}
+	roles := rolesOf(conv.Messages())
+	want := []llmhub.Role{llmhub.RoleSystem, llmhub.RoleUser, llmhub.RoleUser}
+	if !reflect.DeepEqual(roles, want) {
+		t.Fatalf("history roles = %v, want %v", roles, want)
+	}
+	// Answer.Messages excludes the frozen system message prefix.
+	if got := rolesOf(ans.Messages); !reflect.DeepEqual(got, want[1:]) {
+		t.Errorf("Answer.Messages roles = %v, want %v", got, want[1:])
+	}
+	if !strings.Contains(textOf(ans.Messages[1]), "The turn was aborted") {
+		t.Errorf("notice = %q", textOf(ans.Messages[1]))
+	}
+}
+
+// TestConversationCtxCancelFiresOnErrorAndRemembers: cancellation is a
+// failure like any other — OnError fires with the partial answer, and the
+// aborted turn joins the history with the same repaired shape.
+func TestConversationCtxCancelFiresOnErrorAndRemembers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	canceling := Tool{
+		Def: llmhub.NewTool("canceler", "Cancels the run", map[string]any{"type": "object"}),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			cancel()
+			return "", ctx.Err()
+		},
+	}
+	resetScript(t, callTurn(llmhub.ToolCall("c1", "canceler", `{}`)))
+	var reported *Answer
+	var reportedErr error
+	conv := newFakeAgent(t, WithTools(canceling), WithHooks(Hooks{
+		OnError: func(ctx context.Context, ev *Event) error {
+			reported = ev.Answer
+			reportedErr = ev.Err
+			return nil
+		},
+	})).Conversation()
+
+	ans, err := conv.Ask(ctx, "q1")
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if ans == nil || ans.Status != StatusFailed {
+		t.Fatalf("Answer = %+v, want StatusFailed", ans)
+	}
+	if reported == nil {
+		t.Fatal("OnError never fired on context cancellation")
+	}
+	if reported != ans {
+		t.Errorf("OnError answer = %+v, want the returned answer", reported)
+	}
+	if !errors.Is(reportedErr, context.Canceled) {
+		t.Errorf("OnError err = %v, want context.Canceled", reportedErr)
+	}
+	// Same repaired shape as any failed turn: query, assistant call,
+	// synthesized result, abort notice.
+	msgs := conv.Messages()
+	wantRoles := []llmhub.Role{
+		llmhub.RoleUser, llmhub.RoleAssistant, llmhub.RoleTool, llmhub.RoleUser,
+	}
+	if !reflect.DeepEqual(rolesOf(msgs), wantRoles) {
+		t.Fatalf("history roles = %v, want %v", rolesOf(msgs), wantRoles)
+	}
+	if got := textOf(msgs[2]); got != "error: run aborted before execution: context canceled" {
+		t.Errorf("synthesized result = %q", got)
+	}
+	if got := textOf(msgs[3]); got != "The previous attempt failed before completing: context canceled. The turn was aborted." {
+		t.Errorf("notice = %q", got)
+	}
+}
+
+// TestConversationPrefixStabilityAcrossFailedTurn: the failed turn joins
+// the history append-only, so the next turn's provider request reproduces
+// it verbatim and provider-valid — no unanswered tool calls anywhere.
+func TestConversationPrefixStabilityAcrossFailedTurn(t *testing.T) {
+	boom := errors.New("mid-turn outage")
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		fakeTurn{err: boom},
+		textTurn("recovered"),
+	)
+	conv := newFakeAgent(t, WithTools(echoTool()), WithSystemPrompt("sys")).Conversation()
+	if _, err := conv.Ask(context.Background(), "q1"); !errors.Is(err, boom) {
+		t.Fatalf("turn 1 error = %v, want boom", err)
+	}
+	before := conv.Messages()
+	assertNoUnansweredToolCalls(t, before)
+	// The failed turn is in the history, closed by its notice.
+	if got := textOf(before[len(before)-1]); !strings.Contains(got, "The turn was aborted") {
+		t.Fatalf("history ends with %q, want the abort notice", got)
+	}
+
+	a2, err := conv.Ask(context.Background(), "q2")
+	if err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+	if a2.Text != "recovered" {
+		t.Errorf("turn 2 Text = %q", a2.Text)
+	}
+	after := conv.Messages()
+
+	// The prefix is intact and identical, entry by entry.
+	if len(after) <= len(before) {
+		t.Fatalf("history shrank: %d messages", len(after))
+	}
+	for i := range before {
+		if before[i] != after[i] {
+			t.Errorf("history entry %d was replaced, want the same message", i)
+		}
+	}
+
+	// Turn 2's prompt reproduces the failed turn verbatim.
+	reqs := fakeRequests()
+	if len(reqs) != 3 {
+		t.Fatalf("requests = %d, want 3", len(reqs))
+	}
+	if !equalMessages(reqs[2].prompt[:len(before)], before) {
+		t.Error("turn 2 prompt does not reproduce the failed turn verbatim")
+	}
+	assertNoUnansweredToolCalls(t, reqs[2].prompt)
 }

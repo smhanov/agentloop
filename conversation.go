@@ -41,10 +41,12 @@ func (a *Agent) Conversation(opts ...Option) *Conversation {
 }
 
 // Ask runs one turn of the conversation to completion. Budgets (tool calls,
-// steps, duplicate detection) apply per turn. When the run produces an
-// Answer — even a budget-exhausted partial one — its messages join the
-// history; aborted runs (transport, hook, or context errors) leave the
-// history untouched.
+// steps, duplicate detection) apply per turn. Every turn joins the history
+// once it ends: completed answers, budget-exhausted partial runs, and — the
+// default — failed turns too. An aborted run (transport, hook, or context
+// error) returns the error alongside a StatusFailed partial Answer whose
+// messages join the history, closed by synthesized results for unanswered
+// tool calls and an abort notice, so the next turn sees what was attempted.
 func (c *Conversation) Ask(ctx context.Context, query string, opts ...Option) (*Answer, error) {
 	if !c.mu.TryLock() {
 		return nil, fmt.Errorf("agentloop: %w", ErrConversationBusy)
@@ -60,8 +62,9 @@ func (c *Conversation) Ask(ctx context.Context, query string, opts ...Option) (*
 
 // AskStream is Conversation.Ask with streaming (see Agent.AskStream): all
 // loop events are forwarded on the returned channel, which closes after
-// Done or Error. The turn's messages join the history when the run
-// finishes, just like Ask. The channel must be drained until close.
+// Done or Error. The turn's messages join the history when the run ends —
+// failed turns included — just like Ask. The channel must be drained until
+// close.
 func (c *Conversation) AskStream(ctx context.Context, query string, opts ...Option) (<-chan Event, error) {
 	if !c.mu.TryLock() {
 		return nil, fmt.Errorf("agentloop: %w", ErrConversationBusy)

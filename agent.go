@@ -63,6 +63,9 @@ func (a *Agent) Tools() []Tool {
 // Ask runs the loop to completion for one user query and returns the full
 // trace. opts override the Agent's construction options for this call only;
 // they are applied after the constructor options, so later options win.
+// A run that aborts mid-loop (transport, hook, or context error) returns
+// the error alongside a partial StatusFailed Answer carrying the transcript
+// so far — check err first, but never assume the Answer is nil on error.
 func (a *Agent) Ask(ctx context.Context, query string, opts ...Option) (*Answer, error) {
 	cfg := a.cfg
 	applyOptions(&cfg, opts)

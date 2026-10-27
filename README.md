@@ -273,7 +273,11 @@ ans, err := ag.Ask(ctx, "What time is it in UTC right now?")
 `New` returns an error instead of panicking (wrapping `ErrNoLLMClient`
 for a nil client); `MustNew` is the same for examples and tests. `Ask`
 runs the loop to completion for one query and returns `*Answer` — text
-plus the full trace. `AskStream` is the streaming form (see
+plus the full trace. When a run aborts mid-loop (transport, hook, or
+context error) the error comes back **alongside** a partial `Answer`
+(`StatusFailed`) carrying the transcript so far: check `err` first, but
+never assume the answer is nil on error. `AskStream` is the streaming form
+(see
 [Streaming](#streaming)). `Tools` returns the registered tool set, which
 presets use to merge their tools with yours. Every option works both at
 construction and per call (`ag.Ask(ctx, q, agentloop.WithMaxToolCalls(2))`);
@@ -469,6 +473,7 @@ How runs end — `Answer.Status`:
 | `StatusCompleted` | the model produced a final answer (including the forced answer after the tool budget ran out) |
 | `StatusStopped` | graceful stop: a `BeforeGenerate` hook set `Skip`, or duplicate-call detection fired (identical calls with identical output) |
 | `StatusBudgetExhausted` | the `MaxSteps` ceiling was reached; `Ask` also returns an error wrapping `ErrBudgetExhausted` |
+| `StatusFailed` | the run aborted mid-loop (transport, hook, compactor, or context error); `Ask` also returns the error, and the `Answer` carries the partial transcript with its tail repaired for the next request (see [Conversations](#conversations)) |
 
 ## Streaming
 
@@ -540,6 +545,14 @@ second, err := conv.Ask(ctx, "And when is the next one expected?")
   lifetime — this preserves provider prompt caching across turns. Long
   sessions are ideal cache candidates: pass
   `WithGenerateOptions(llmhub.WithCacheKey("session-id"))`.
+- **Failed turns are remembered.** A turn that dies mid-loop (transport,
+  hook, or context error) joins the history like any other: the error
+  returns alongside a partial `Answer` with `StatusFailed`, and its
+  messages append to the transcript — synthesized error results closing
+  any unanswered tool calls, then a user-role notice stating what failed.
+  The next turn sees what was attempted and sends a provider-valid
+  request. Callers that used to branch on `ans == nil` after an error
+  should check `err` instead; `errors.Is` workflows are unaffected.
 - **Per-turn options.** Options passed to `Conversation` set the defaults
   (including the frozen system message); options passed to a turn's
   `Ask`/`AskStream` apply only to that turn. A per-turn

@@ -950,8 +950,17 @@ func TestAskCtxCancelMidTool(t *testing.T) {
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
-	if ans != nil {
-		t.Errorf("Answer = %+v, want nil", ans)
+	// Cancellation is a failure like any other: the partial answer comes
+	// back with its tail repaired.
+	if ans == nil || ans.Status != StatusFailed {
+		t.Fatalf("Answer = %+v, want StatusFailed", ans)
+	}
+	wantRoles := []llmhub.Role{llmhub.RoleUser, llmhub.RoleAssistant, llmhub.RoleTool, llmhub.RoleUser}
+	if !reflect.DeepEqual(rolesOf(ans.Messages), wantRoles) {
+		t.Errorf("roles = %v, want %v", rolesOf(ans.Messages), wantRoles)
+	}
+	if got := textOf(ans.Messages[2]); got != "error: run aborted before execution: context canceled" {
+		t.Errorf("synthetic result = %q", got)
 	}
 	if reqs := fakeRequests(); len(reqs) != 1 {
 		t.Errorf("requests = %d, want 1", len(reqs))
@@ -1103,10 +1112,52 @@ func TestHookErrorAborts(t *testing.T) {
 	if !errors.Is(reported, errBoom) {
 		t.Errorf("OnError err = %v", reported)
 	}
-	if ans != nil {
-		t.Errorf("Answer = %+v, want nil", ans)
+	// The aborted turn still returns a partial answer: the query plus the
+	// abort notice.
+	if ans == nil || ans.Status != StatusFailed {
+		t.Fatalf("Answer = %+v, want StatusFailed", ans)
+	}
+	wantRoles := []llmhub.Role{llmhub.RoleUser, llmhub.RoleUser}
+	if !reflect.DeepEqual(rolesOf(ans.Messages), wantRoles) {
+		t.Errorf("roles = %v, want %v", rolesOf(ans.Messages), wantRoles)
 	}
 	if reqs := fakeRequests(); len(reqs) != 0 {
 		t.Errorf("provider called %d times, want 0", len(reqs))
 	}
+}
+
+// TestAskErrorReturnsPartialAnswer: a run that dies mid-loop on a provider
+// error returns what it accomplished — the error comes back alongside a
+// StatusFailed Answer whose transcript closes provider-valid, and OnError
+// sees the same answer.
+func TestAskErrorReturnsPartialAnswer(t *testing.T) {
+	boom := errors.New("provider 500")
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		fakeTurn{err: boom},
+	)
+	var reported *Answer
+	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+		OnError: func(ctx context.Context, ev *Event) error { reported = ev.Answer; return nil },
+	}))
+
+	ans, err := ag.Ask(context.Background(), "q")
+	if !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want boom", err)
+	}
+	if ans == nil || ans.Status != StatusFailed {
+		t.Fatalf("Answer = %+v, want StatusFailed", ans)
+	}
+	if reported != ans {
+		t.Errorf("OnError answer = %+v, want the returned answer", reported)
+	}
+	// Transcript: user, assistant call, tool result, abort notice.
+	wantRoles := []llmhub.Role{llmhub.RoleUser, llmhub.RoleAssistant, llmhub.RoleTool, llmhub.RoleUser}
+	if !reflect.DeepEqual(rolesOf(ans.Messages), wantRoles) {
+		t.Errorf("roles = %v, want %v", rolesOf(ans.Messages), wantRoles)
+	}
+	if !strings.Contains(textOf(ans.Messages[3]), "The turn was aborted") {
+		t.Errorf("notice = %q", textOf(ans.Messages[3]))
+	}
+	assertNoUnansweredToolCalls(t, ans.Messages)
 }

@@ -21,6 +21,12 @@ const (
 	// StatusStopped means the run stopped gracefully: a BeforeGenerate hook
 	// set Skip, or the duplicate-call limit detected a loop.
 	StatusStopped
+	// StatusFailed means the run aborted before completing: a transport,
+	// hook, compactor, or context error ended it mid-loop. Ask also returns
+	// the error, and the Answer carries the partial transcript with its
+	// tail repaired for the next provider request — synthesized results
+	// for unanswered tool calls, then an abort notice.
+	StatusFailed
 )
 
 // ToolResult records one tool execution in the trace.

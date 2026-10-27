@@ -24,6 +24,18 @@ const forcedFinalNotice = "The tool budget for this run is exhausted: no further
 	"Do not narrate further research plans, do not say what you would check next, and do not ask permission — " +
 	"produce the final answer the user will read."
 
+// abortedCallResult is the synthetic tool result delivered for each call a
+// failed run left unanswered: providers reject an assistant tool-call
+// message whose calls never received results (Anthropic requires a
+// tool_result per tool_use; OpenAI requires tool messages keyed by call
+// ID), so the recorded turn must close them before it is remembered.
+const abortedCallResult = "error: run aborted before execution: %s"
+
+// abortedNotice is the user-role marker appended after an aborted run's
+// repaired transcript, so the recorded turn closes with an explicit
+// statement of what happened.
+const abortedNotice = "The previous attempt failed before completing: %s. The turn was aborted."
+
 // run holds the mutable state of a single Ask or AskStream. A run is used
 // by one goroutine (plus short-lived dispatch workers that only touch
 // their own result slots).
@@ -169,10 +181,13 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 		resp, err := r.infer(ctx, llm, context, r.generateOptions(forceFinal))
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				// Context errors come back unwrapped.
-				r.reportError(hooks, nil, ctxErr)
-				r.emit(&Event{Kind: EventError, Err: ctxErr})
-				return nil, ctxErr
+				// Context errors come back unwrapped, but they fail the run
+				// exactly like every other terminal error: OnError fires and
+				// the partial answer rides the event.
+				ans := r.abortAnswer(ctxErr)
+				r.reportError(hooks, ans, ctxErr)
+				r.emit(&Event{Kind: EventError, Err: ctxErr, Answer: ans})
+				return ans, ctxErr
 			}
 			return r.fail(err)
 		}
@@ -301,11 +316,44 @@ func (r *run) finish(status AnswerStatus) (*Answer, error) {
 }
 
 // fail reports a terminal failure via OnError and the event stream and
-// returns it; the error is still returned from execute.
+// returns it; the error is still returned from execute. The run's work is
+// not discarded: its partial transcript — tail repaired for the next
+// provider request — comes back in a StatusFailed Answer, so a
+// Conversation remembers the failed turn like any other.
 func (r *run) fail(err error) (*Answer, error) {
-	r.reportError(r.cfg.hooks, nil, err)
-	r.emit(&Event{Kind: EventError, Err: err})
-	return nil, err
+	ans := r.abortAnswer(err)
+	r.reportError(r.cfg.hooks, ans, err)
+	r.emit(&Event{Kind: EventError, Err: err, Answer: ans})
+	return ans, err
+}
+
+// abortAnswer assembles the Answer for a run that died mid-loop: this
+// run's own messages plus the usage and trace accumulated so far, under
+// StatusFailed. The transcript tail is repaired first so the recorded turn
+// stays provider-valid.
+func (r *run) abortAnswer(err error) *Answer {
+	r.repairAbortedTail(err)
+	return r.answer(StatusFailed)
+}
+
+// repairAbortedTail closes an aborted run's transcript with appends only —
+// no earlier message is rewritten. Every unanswered tool call in the final
+// assistant message receives a synthetic error result, and a user-role
+// notice records the abort. A user message is valid after any tail, so the
+// repaired history is safe to send to the provider on the next turn.
+func (r *run) repairAbortedTail(err error) {
+	if n := len(r.transcript); n > 0 {
+		if last := r.transcript[n-1]; last.Role == llmhub.RoleAssistant {
+			for _, part := range last.Content {
+				call, ok := part.(*llmhub.ToolCallContent)
+				if !ok {
+					continue
+				}
+				r.appendToolResult(call, fmt.Sprintf(abortedCallResult, err))
+			}
+		}
+	}
+	r.transcript = append(r.transcript, llmhub.NewUserMessage(llmhub.Text(fmt.Sprintf(abortedNotice, err))))
 }
 
 // reportError reports a terminal failure via OnError; the error is still

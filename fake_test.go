@@ -271,6 +271,28 @@ func rolesOf(msgs []*llmhub.Message) []llmhub.Role {
 	return roles
 }
 
+// assertNoUnansweredToolCalls fails the test when any assistant tool call
+// in msgs lacks a matching tool result — the shape providers reject.
+func assertNoUnansweredToolCalls(t *testing.T, msgs []*llmhub.Message) {
+	t.Helper()
+	answered := map[string]bool{}
+	for _, m := range msgs {
+		if m.Role == llmhub.RoleTool {
+			answered[m.Meta["tool_call_id"]] = true
+		}
+	}
+	for _, m := range msgs {
+		if m.Role != llmhub.RoleAssistant {
+			continue
+		}
+		for _, call := range callsOf(m) {
+			if !answered[call.ID] {
+				t.Errorf("unanswered tool call %s (%s)", call.ID, call.Name)
+			}
+		}
+	}
+}
+
 // equalMessages reports whether two message lists are deep-equal (roles,
 // metadata, and content parts).
 func equalMessages(a, b []*llmhub.Message) bool {
