@@ -32,6 +32,7 @@ type config struct {
 	toolChoice      llmhub.ToolChoice
 	generateOptions []llmhub.Option
 	hooks           Hooks
+	compactor       Compactor
 	settings        map[string]any
 	// skillDirs and pinnedNames record construction-time skill intent
 	// (WithSkills / WithPinnedSkills). resolveSkills consumes them once in
@@ -165,6 +166,15 @@ func WithGenerateOptions(opts ...llmhub.Option) Option {
 // extension surface. Unset hook fields are no-ops.
 func WithHooks(h Hooks) Option {
 	return func(c *config) { c.hooks = h }
+}
+
+// WithCompactor installs a Compactor that bounds context growth. It runs
+// after the RebuildContext hook before every LLM call and may replace the
+// view wholesale; replacements are ephemeral, exactly like the hook's (see
+// the Compactor interface for the contract, and NewTokenCompactor for the
+// shipped reference implementation). Unset means no compaction.
+func WithCompactor(c Compactor) Option {
+	return func(cfg *config) { cfg.compactor = c }
 }
 
 // WithSetting attaches a named value to the option list on behalf of the

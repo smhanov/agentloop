@@ -287,6 +287,7 @@ per-call options apply after the constructor's, so the later one wins.
 | `WithParallelTools(n)` | 3 | Max concurrent parallel-eligible executions per step; 1 forces strictly sequential. |
 | `WithStreamWatchdog(d)` | 90s | Aborts `AskStream` when no chunk arrives for `d` (`ErrStreamStale`); 0 disables. |
 | `WithHooks(h)` | none | Hook callbacks — the extension surface ([Hooks](#hooks)). |
+| `WithCompactor(c)` | none | Installs a `Compactor` that bounds context growth; runs after `RebuildContext` before every call (see [Context compaction](#writing-your-own-agent)). |
 | `WithSkills(dirs ...)` | none | Enables skills: catalog in the prompt + `skill_read` tool. Construction-time only. |
 | `WithPinnedSkills(names ...)` | none | Inlines up to two skill bodies into the system prompt. Construction-time only. |
 | `WithToolChoice(c)` | `llmhub.AutoToolChoice()` | Default tool-choice policy; the loop forces `llmhub.NoToolChoice()` itself when the tool budget is spent. |
@@ -396,7 +397,7 @@ immediately without executing the tools.
 populated depends on `Kind` (`EventStart`, `EventBeforeGenerate`,
 `EventRebuildContext`, `EventAfterGenerate`, `EventAnswerDelta`,
 `EventReasoningDelta`, `EventBeforeToolCall`, `EventAfterToolCall`,
-`EventDone`, `EventError`):
+`EventDone`, `EventError`, `EventCompact`):
 
 | Field | Meaning |
 | --- | --- |
@@ -404,7 +405,8 @@ populated depends on `Kind` (`EventStart`, `EventBeforeGenerate`,
 | `Step` | 1-based model inference the event belongs to |
 | `Query` | the user query (`EventStart`) |
 | `Messages` | the transcript so far; appendable in `BeforeGenerate`/`AfterGenerate`, read-only elsewhere |
-| `Context` | the LLM-visible view for this step; pre-seeded to the transcript, replaceable by `RebuildContext` only |
+| `Context` | the LLM-visible view for this step; pre-seeded to the transcript, replaceable by `RebuildContext` and the compactor |
+| `Usage` | the previous step's provider usage (`RebuildContext`/`EventCompact`; zero on a run's first step) |
 | `Skip` | request a graceful stop (`BeforeGenerate`) |
 | `Finish` | whether the response ends the run; flippable (`AfterGenerate`) |
 | `Response` | the model response (`AfterGenerate`) |
@@ -448,6 +450,11 @@ Multiple limit dimensions always apply at once, so no run can run away:
   gracefully with `StatusStopped` before it executes. Any differing call
   or differing output resets the counter. Polling-style tools can opt out
   entirely with `Repetitive: true`.
+- **Context growth** — with `WithCompactor`, the compactor trips on the
+  provider's measured prompt usage and keeps every request inside the
+  model's window (see [Context compaction](#writing-your-own-agent)).
+  Unset, prompts grow with the transcript, bounded only by the budgets
+  above.
 - **Your context** — `ctx` deadlines and cancellation are honored
   everywhere (LLM calls, tools, HTTP, command execution) and returned
   unwrapped. This is the hard wall-clock stop; for *graceful* wall-time
@@ -551,9 +558,10 @@ second, err := conv.Ask(ctx, "And when is the next one expected?")
   a conversation via `Agent()` has no text protocol, limits, or exit
   statuses — use one-shot `Ask` there.)
 - **Compaction is a projection.** When history grows too long, don't
-  rewrite it — derive a shorter LLM view with a `RebuildContext` hook
-  (see [recipes](#writing-your-own-agent)); the conversation log stays
-  complete.
+  rewrite it — derive a shorter LLM view: install the built-in compactor
+  with `WithCompactor(agentloop.NewTokenCompactor(...))` (see
+  [Context compaction](#writing-your-own-agent)) or derive one with a
+  `RebuildContext` hook; the conversation log stays complete.
 
 ## Skills
 
@@ -896,38 +904,89 @@ hooks := agentloop.Hooks{
 }
 ```
 
-**Context rebuild and compression via `RebuildContext`.** Long runs and
-conversations outgrow the context window. `RebuildContext` fires before
-every LLM call with `ev.Context` pre-seeded to the full transcript; the
-hook may observe it (log, audit, measure) or replace it wholesale —
-compress older steps into a summary, drop stale tool outputs, enforce a
-token budget, redact secrets:
+**Context compaction via `WithCompactor`.** Long runs and conversations
+outgrow the context window — 150 steps of tool results overflow most
+models. A `Compactor` bounds that growth. It runs after `RebuildContext`
+before every LLM call with `ev.Context` pre-seeded to the exact view about
+to be sent and `ev.Usage` carrying the previous step's measured prompt
+usage; it may replace `ev.Context` wholesale, and the replacement is
+ephemeral — the transcript, `Answer.Messages`, and conversation history
+stay complete.
+
+The shipped reference implementation is deterministic and makes no LLM
+calls. It trips when the last measured `PromptTokens` reach the window
+minus `max(15%, 16k)` — never before, so the zero-usage first step and
+every comfortably-small step are free — then prunes old tool outputs
+first and, if that is not enough, replaces the elided middle with a
+frozen checkpoint stub plus a verbatim recent tail:
 
 ```go
-const keep = 6 // never compress the most recent messages
-
-hooks := agentloop.Hooks{
-    RebuildContext: func(ctx context.Context, ev *agentloop.Event) error {
-        if len(ev.Context) <= keep {
-            return nil
-        }
-        summary := summarize(ev.Context[:len(ev.Context)-keep]) // your summarizer
-        ev.Context = append([]*llmhub.Message{
-            llmhub.NewSystemMessage(llmhub.Text("Earlier steps, summarized: " + summary)),
-        }, ev.Context[len(ev.Context)-keep:]...)
-        return nil
-    },
-}
+ag := agentloop.MustNew(llm,
+    agentloop.WithSystemPrompt("You are a research assistant."),
+    agentloop.WithTools(clock),
+    agentloop.WithCompactor(agentloop.NewTokenCompactor(128000, 15000, 1)),
+)
 ```
 
-Three invariants make this safe: replacements are **ephemeral** (only
-this call is affected; the transcript, `Answer.Messages`, and
-conversation history are untouched); the projection must be
-**deterministic** (same transcript prefix → same projected prefix, or
-prompt caching busts); and the trailing assistant tool-call message with
-its tool-result messages — the in-flight pair — must survive verbatim,
-because providers reject contexts with unanswered tool calls. Compression
-that eats in-flight state breaks every tool protocol.
+`NewTokenCompactor(windowTokens, tailTokens, keepFirst)` takes the
+model's usable window, the verbatim-tail budget in estimated tokens
+(0 selects 15k), and how many messages after the system message stay
+verbatim (0 selects 1 — the task message). The projection is
+`[system][keep-first][checkpoint][verbatim tail]`: the system message is
+never touched, the tail never starts inside a tool-call group (an
+assistant tool-call message and all of its results — parallel calls
+included — always travel together), and the checkpoint is memoized
+between trips, so the projected prefix is byte-stable step-over-step and
+provider prompt caches keep hitting. One `TokenCompactor` value can be
+shared by any number of concurrent runs and Agents.
+
+**Writing your own Compactor.** `Compactor` is a one-method interface, so
+an LLM summarizer backed by your own (cheap) client is a dozen lines.
+Keep it deterministic: memoize the summary per elided range and refreeze
+it only when the range grows — a summary that changes every step busts
+the prompt cache. Reuse the system message verbatim (`ev.Context[0]`),
+and keep the trailing assistant tool-call message with all of its tool
+results:
+
+```go
+// summarizer compacts by asking a model for a summary of the older
+// steps. The trigger mirrors the built-in compactor: measured prompt
+// usage against the model's window.
+type summarizer struct {
+	llm *llmhub.Client
+}
+
+func (s *summarizer) Compact(ctx context.Context, ev *agentloop.Event) error {
+	if ev.Usage.PromptTokens < 100000 {
+		return nil // under the trip point: the no-op is the common case
+	}
+	summary, err := s.llm.Generate(ctx, []*llmhub.Message{
+		llmhub.NewUserMessage(llmhub.Text(
+			"Summarize the conversation so far in a few sentences: " +
+				messageText(ev.Messages))), // your prompt
+	})
+	if err != nil {
+		return err
+	}
+	ev.Context = append([]*llmhub.Message{
+		ev.Messages[0], // the system message, verbatim
+		llmhub.NewUserMessage(llmhub.Text("Earlier steps, summarized: " + summary.Text())),
+	}, ev.Messages[len(ev.Messages)-20:]...) // the recent tail, verbatim
+	return nil
+}
+
+ag := agentloop.MustNew(llm, agentloop.WithCompactor(&summarizer{llm: llm}))
+```
+
+(For observe-only uses — logging, auditing, measuring the exact context —
+the raw `RebuildContext` hook remains the seam.) The same three invariants
+make either mechanism safe, and the loop enforces the boundaries: the
+replacement is **ephemeral** (only this call is affected), the projection
+should be **deterministic** (same transcript prefix → same projected
+prefix, or prompt caching busts), and the trailing assistant tool-call
+message with its tool-result messages — the in-flight pair — must survive
+verbatim, because providers reject contexts with unanswered tool calls.
+Compaction that eats in-flight state breaks every tool protocol.
 
 ## Testing your agent
 

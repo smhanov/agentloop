@@ -11,7 +11,7 @@ import (
 // EventKind identifies which loop point an Event was fired from.
 type EventKind int
 
-// The loop points. Every hook event carries its kind in Event.Kind.
+// The loop points. Every event carries its kind in Event.Kind.
 const (
 	EventStart EventKind = iota
 	EventBeforeGenerate
@@ -23,6 +23,7 @@ const (
 	EventAfterToolCall
 	EventDone
 	EventError
+	EventCompact
 )
 
 // Hooks is the extension surface of the loop: optional callbacks fired
@@ -84,8 +85,12 @@ type Event struct {
 	// transcript entries.
 	Messages []*llmhub.Message
 	// Context is the LLM-visible view for this step: pre-seeded to the
-	// transcript and replaceable by the RebuildContext hook.
+	// transcript and replaceable by the RebuildContext hook and the
+	// Compactor.
 	Context []*llmhub.Message
+	// Usage is the previous step's provider usage (RebuildContext and
+	// Compact); zero on a run's first step.
+	Usage llmhub.UsageMetadata
 	// Skip requests a graceful stop (BeforeGenerate).
 	Skip bool
 	// Finish reports — and may be flipped to change — whether the response

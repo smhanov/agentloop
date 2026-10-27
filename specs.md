@@ -90,7 +90,9 @@ research pipeline; use agentloop when you want to build your own agent.
 - Durable/persistent sessions (disk-backed transcripts, per-user session
   stores) — the in-memory `Conversation` is the v0 scope.
 - Orchestration of multiple agents, planner/synthesizer pipelines (laconic's
-  territory), or autonomous long-running daemons.
+  territory), or autonomous long-running daemons. (Long-running *runs* are
+  bounded: budgets cap steps and tools, and the built-in compactor bounds
+  context growth, §5.3; daemon supervision stays with the caller.)
 - Skills roll-out phases 3–4 (`docs/references.md` §7): agent authoring
   nudges, BM25 routing, skill hubs/marketplaces, quarantine + provenance
   lockfiles, per-skill subprocess isolation. v0 ships phases 0–2
@@ -141,6 +143,7 @@ agentloop/          github.com/smhanov/agentloop — the core loop
   conversation.go   Conversation: multi-turn sessions over Agent
   tool.go           Tool type, Handler, dispatch, unknown-tool handling
   hooks.go          Hooks struct, Event types and kinds
+  compactor.go      Compactor interface, TokenCompactor reference implementation (§5.3)
   options.go        functional options (constructor + per-call)
   answer.go         Answer, ToolResult trace types
   skills.go         Skill loading/validation, catalog rendering, skill_read tool (§5.8)
@@ -186,6 +189,7 @@ WithParallelTools(n int) Option        // max concurrent parallel-eligible (Sequ
 WithDupCallLimit(n int) Option         // consecutive identical calls with identical output before graceful stop; default 3; 0 disables
 WithStreamWatchdog(d time.Duration) Option // abort AskStream when no chunk arrives for d; default 90s; 0 disables
 WithHooks(h Hooks) Option              // hook callbacks (see §5.3)
+WithCompactor(c Compactor) Option      // bound context growth (see §5.3)
 WithSkills(dirs ...string) Option      // enable skills: catalog in prompt + skill_read tool (see §5.8)
 WithToolChoice(c llmhub.ToolChoice) Option // default llmhub.AutoToolChoice()
 WithGenerateOptions(opts ...llmhub.Option) Option // forwarded to every Generate/Stream (e.g. temperature, cache key)
@@ -304,7 +308,8 @@ Semantics:
   - Replacements are **ephemeral** — they affect only this call; the
     transcript, `Answer.Messages`, and Conversation history are unchanged.
   - Ordering: `BeforeGenerate` (transcript appends persist) →
-    `RebuildContext` (projection) → `Generate(ctx, ev.Context, …)`.
+    `RebuildContext` (projection) → `Compactor` (built-in bound, §5.3) →
+    `Generate(ctx, ev.Context, …)`.
   - **Invariant hooks must preserve:** the trailing assistant
     tool-call message and its tool-result messages of the most recent
     step must survive verbatim — providers reject contexts with
@@ -340,14 +345,16 @@ const (
     EventAfterToolCall
     EventDone
     EventError
+    EventCompact
 )
 
 type Event struct {
     Kind     EventKind
     Step     int                     // 1-based model inference (see vocabulary, §5.1)
     Query    string                  // Start
-    Messages []*llmhub.Message       // Start, BeforeGenerate, AfterGenerate (appendable); RebuildContext: full transcript, read-only
-    Context  []*llmhub.Message       // RebuildContext: the LLM-visible view this step; pre-seeded with the transcript; hook may replace
+    Messages []*llmhub.Message       // Start, BeforeGenerate, AfterGenerate (appendable); RebuildContext/Compact: full transcript, read-only
+    Context  []*llmhub.Message       // RebuildContext/Compact: the LLM-visible view this step; pre-seeded with the transcript; either may replace
+    Usage    llmhub.UsageMetadata    // RebuildContext/Compact: the previous step's provider usage; zero on the first step
     Skip     bool                    // BeforeGenerate: request graceful stop
     Finish   bool                    // AfterGenerate: default = no tool calls; hook may flip
     Response *llmhub.Response       // AfterGenerate
@@ -361,6 +368,86 @@ type Event struct {
     Answer   *Answer                 // Done
 }
 ```
+
+#### Context compaction (Compactor)
+
+Beyond the raw `RebuildContext` seam, the core ships a dedicated
+extension point for the single most common rebuild policy — bounding
+context growth (issue: nothing bounds transcript growth; long-running
+agents overflow the window):
+
+```go
+// Compactor bounds context growth. Compact runs before each model call,
+// after BeforeGenerate appends and after the RebuildContext hook;
+// ev.Context is pre-seeded to the current LLM view and ev.Usage carries
+// the previous step's provider usage (zero on the first step). A
+// compactor may replace ev.Context. Implementations must be deterministic
+// (same input view and state → same output, or prompt caching busts),
+// must preserve the trailing assistant tool-call message and all of its
+// tool results, and must treat the replacement as ephemeral.
+type Compactor interface {
+    Compact(ctx context.Context, ev *Event) error
+}
+
+func WithCompactor(c Compactor) Option
+```
+
+Semantics:
+
+- Firing order per step: `BeforeGenerate` (transcript appends persist) →
+  forced-final notice → `RebuildContext` (existing hook, unchanged) →
+  `Compactor` → `Generate(ctx, view, …)`. The compactor sees the view
+  after the hook's replacement, and is the last word before the call.
+- A compactor error aborts the run with a wrapped error carrying the
+  `agentloop: compactor:` prefix (same contract as hook errors).
+- Unset (the default): the view passes through untouched — byte-identical
+  legacy behavior.
+
+The shipped reference implementation:
+
+```go
+func NewTokenCompactor(windowTokens, tailTokens int64, keepFirst int) *TokenCompactor
+```
+
+`TokenCompactor` is a deterministic, token-triggered projection with no
+LLM calls:
+
+- **Trigger** — the exact, provider-reported `PromptTokens` of the
+  previous step (a zero usage — the first step — is a no-op). The trip
+  point is `windowTokens − max(15% of windowTokens, 16000)` (the
+  opencode/Codex convergence; measured usage, not message counts, and
+  not an estimate). Once tripped, the compactor keeps projecting; a
+  re-trip recomputes the state — the elided range grows, the tail budget
+  stays.
+- **Projection** — `[system][keep-first][checkpoint?][verbatim tail]`.
+  First lever: prune old tool results in place (each keeps its role and
+  metadata, content becomes `[tool output elided by compaction: N
+  chars]`) so every tool-call group stays provider-valid. If pruning is
+  not enough, the whole middle is replaced by a frozen checkpoint stub —
+  a deterministic user message summarizing shape (role counts, elided
+  range, first lines of elided user messages, bounded). The system
+  message (`Context[0]`) is never modified.
+- **Tail boundary** — roughly `tailTokens` estimated tokens (characters/4;
+  default 15000) walked back from the end, with the boundary moved back so
+  it never lands inside a tool-call group: the trailing assistant
+  tool-call message plus ALL of its results (parallel included) always
+  travel together. The char/4 estimate is deliberately crude and sizes
+  only the tail and the prune-vs-checkpoint decision; the trigger is the
+  exact provider number.
+- **Memoization** — between trips the projection is a pure function of
+  (transcript, frozen state): the stub and the tail boundary stay put
+  while the transcript appends, so the projected prefix is byte-stable
+  step-over-step and the prompt-cache breakpoint survives; each trip
+  costs one cache rebuild.
+- **Concurrency** — the memoized state is per run: the loop clones
+  `TokenCompactor` via an unexported seam at the start of each run, so
+  one value can be shared by any number of concurrent runs. A
+  multi-turn `Conversation` therefore re-derives its checkpoint per turn
+  (one prefix rebuild per turn where it trips).
+- **Known limit** — the trigger is post-hoc: the first trip after a burst
+  can land one call late on a huge single step. An emergency
+  overflow-error retry ladder needs cross-provider error classification
+  (neither agentloop nor llmhub has it) and remains a recorded follow-up.
 
 ### 5.4 Asking
 
@@ -389,9 +476,10 @@ Loop algorithm:
 2. Fire `BeforeGenerate`; if `ev.Skip`, stop gracefully and synthesize the
    answer from current context (used for cost caps, "stop early" rules).
 3. Fire `RebuildContext` (if set) with `ev.Context` pre-seeded to the
-   transcript; `Generate` is called with `ev.Context` — unset hook means
-   the transcript itself is the context (§5.3). (Stream in streaming
-   mode, deltas forwarded to `OnDelta`.)
+   transcript, then the `Compactor` (if installed); `Generate` is called
+   with the resulting view — unset hook and compactor mean the transcript
+   itself is the context (§5.3). (Stream in streaming mode, deltas
+   forwarded to `OnDelta`.)
 4. Append the assistant message verbatim; fire `AfterGenerate` with
    `ev.Finish = len(resp.ToolCalls()) == 0` and `ev.Messages` appendable.
 5. If `ev.Finish` is true: the step's text is the final answer → fire
@@ -450,7 +538,8 @@ Semantics:
   for the conversation's lifetime; dynamic facts (time, cwd, context
   updates) belong in the newest user message — never the system prompt.
   This preserves provider prompt caching across turns. **History compaction
-  is the sanctioned mutation, done as a projection**: a `RebuildContext`
+  is the sanctioned mutation, done as a projection**: the built-in
+  `WithCompactor(NewTokenCompactor(...))` (§5.3) or a `RebuildContext`
   hook derives a shorter LLM view (e.g. older turns summarized) while the
   Conversation log stays complete — no need to start a fresh
   Conversation (§5.3).
@@ -1135,6 +1224,7 @@ Verified against the live API (same host and key as `/search`):
 | fetch of a 404/unreachable page | tool result `{"error": "fetch failed: <status>"}`; model may try another result (§9.4) |
 | fetch of a non-http(s)/malformed URL | tool result `{"error": "invalid arguments"}` |
 | hook error (non-sentinel) | run aborts; wrapped error naming the hook |
+| compactor error | run aborts; wrapped error with the `agentloop: compactor:` prefix |
 | `ErrSkipToolCall` from BeforeToolCall | tool skipped, not executed, not counted |
 | bash limit hit (step/cost/wall/format) | `bash.Answer` with ExitStatus — not an error |
 | command rejected by approver | observation `{"error": "command not approved: …"}`; model may adjust — not an error |
@@ -1199,7 +1289,18 @@ All offline tests run without network (`go test ./...`).
    mutates prior history; **context rebuild** — a RebuildContext hook that
    compresses older turns sees the full transcript in `ev.Messages`,
    replaces `ev.Context`, and the Conversation log is unchanged; the fake
-   provider captures the exact per-step context sent.
+   provider captures the exact per-step context sent; **compactor** — a
+   200-step scripted run with `NewTokenCompactor` completes with every
+   sent request under the configured window (the contrast run without a
+   compactor grows past it), transcripts stay byte-identical to an
+   uncompacted run, replays are byte-identical per step with the projected
+   prefix stable between trips, trailing tool-call/result pairs (1 and 3
+   parallel calls) survive every projection with the system message
+   verbatim, the trigger fires only on last-step `PromptTokens ≥ window −
+   max(15%, 16k)` with a zero-usage first step as a no-op, a custom
+   Compactor installs via `WithCompactor` and fires after
+   `RebuildContext`, and a compactor error aborts with the
+   `agentloop: compactor:` prefix.
 2. **AskStream (llmhub-parity streaming):** event sequence
    `Start → BeforeGenerate → AfterGenerate → [BeforeToolCall → AfterToolCall]* → AnswerDelta* → Done`;
    channel closes after Done/Error; reasoning deltas forwarded from all
@@ -1507,7 +1608,9 @@ this itself — domain guidance travels with the query, never the agent).
      tools + hooks, text-action protocols via the finish veto (§5.3),
      steering via `BeforeGenerate`, cost caps via `ev.Skip`, **context
      rebuilding/compression via `RebuildContext`** (observe or rebuild the
-     exact context the model sees each step); custom
+     exact context the model sees each step) and the **built-in
+     compactor** (`WithCompactor` + `NewTokenCompactor`, plus a
+     "writing your own Compactor" subsection for LLM summarizers); custom
      `Searcher`/`Fetcher`/`Environment`; testing your agent with a fake
      provider; troubleshooting (budget exhaustion, stale streams,
      format-error loops).
@@ -1572,7 +1675,7 @@ to this spec's choices:
 | §2 loop detection (identical calls and output) | `WithDupCallLimit` + `Tool.Repetitive` (§5.2) |
 | §2 steering/inbox seam (steer/inject/cancel) | `BeforeGenerate` message-append + ctx cancel (§5.5) |
 | §2 loop shape 5: event-log projection (dsh `deriveMessages`) | append-only transcript + `RebuildContext` projection hook (§5.3) — the LLM context is derived, never mutated |
-| §4 overflow → compress + retry; compression is the sanctioned prefix mutation | `RebuildContext` hook: deterministic compression of older steps, trailing tool-call/result pair preserved (§5.3) |
+| §4 overflow → compress + retry; compression is the sanctioned prefix mutation | `RebuildContext` hook for ad-hoc policies; shipped `Compactor` interface + deterministic `TokenCompactor` reference (trigger on measured last-step `PromptTokens` vs `window − max(15%, 16k)`, prune-then-checkpoint, memoized cache-stable prefix, trailing pair preserved) (§5.3); emergency overflow-retry ladder deferred until provider error classification exists |
 | §3 ToolDefinition/ToolSchema split; `isConcurrencySafe` batching | `Tool{Def, Run, Sequential}` + `Repetitive` (§5.2) |
 | §3 guarded execution / approval gates | `WithApprover` on the bash preset; blocking `BeforeToolCall` sanctioned (§5.3, §8.1) |
 | §3 malformed-call repair in-band (Levenshtein names, error results) | §5.2 — tool errors and unknown-name suggestions are tool results, never hard fails |

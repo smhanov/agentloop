@@ -38,6 +38,7 @@ type run struct {
 	steps      int // model inferences so far
 	executed   int // tool calls counted against the budget (Answer.ToolCalls)
 	usage      llmhub.UsageMetadata
+	lastUsage  llmhub.UsageMetadata // the most recent step's provider usage (compactor trigger)
 	timing     *llmhub.TimingMetrics
 	reasoning  strings.Builder
 	lastText   string // the most recent step's assistant text
@@ -47,6 +48,7 @@ type run struct {
 	dupOutput  string // observation of the latest call in that run
 	dupNudged  bool   // the run has warned; the next identical call stops
 	notice     bool   // the forced-final notice is already in the transcript
+	compactor  Compactor
 }
 
 // newRun initializes per-run state from a resolved config.
@@ -60,6 +62,14 @@ func newRun(cfg config) *run {
 func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*Answer, error) {
 	r.ctx = ctx
 	hooks := r.cfg.hooks
+
+	// Resolve the compactor per run: implementations with memoized state
+	// (the reference TokenCompactor) hand out a fresh copy, so concurrent
+	// runs never share one.
+	r.compactor = r.cfg.compactor
+	if rc, ok := r.cfg.compactor.(runCompactor); ok {
+		r.compactor = rc.forRun()
+	}
 
 	// Seed the transcript. Plain Asks seed the configured system message
 	// and keep it in Answer.Messages (prefixLen 0); conversation runs
@@ -122,17 +132,38 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 		}
 
 		// Hook: observe or replace the exact context the model sees. The
-		// transcript itself is never mutated by this hook.
+		// transcript itself is never mutated by this hook. ev.Usage
+		// carries the previous step's provider usage (zero on the first
+		// step) so token-aware hooks can act on the measured size of the
+		// previous view.
 		context := r.transcript
 		if hooks.RebuildContext != nil {
-			ev := &Event{Kind: EventRebuildContext, Step: step, Messages: r.transcript, Context: r.transcript}
+			ev := &Event{Kind: EventRebuildContext, Step: step, Messages: r.transcript, Context: r.transcript, Usage: r.lastUsage}
 			if err := fire(ctx, hooks.RebuildContext, ev); err != nil {
 				return r.fail(fmt.Errorf("agentloop: RebuildContext hook: %w", err))
 			}
 			if ev.Context != nil {
 				context = ev.Context
 			}
-			r.emit(&Event{Kind: EventRebuildContext, Step: step, Messages: r.transcript, Context: context})
+			r.emit(&Event{Kind: EventRebuildContext, Step: step, Messages: r.transcript, Context: context, Usage: r.lastUsage})
+		}
+
+		// Compactor: the built-in seam for bounding context growth, fired
+		// after RebuildContext with ev.Context pre-seeded to the view
+		// about to be sent and ev.Usage carrying the previous step's
+		// provider usage. A compactor may replace ev.Context wholesale;
+		// the replacement is ephemeral exactly like RebuildContext's —
+		// the transcript, Answer.Messages, and Conversation history stay
+		// complete. Unset: the view passes through untouched.
+		if r.compactor != nil {
+			ev := &Event{Kind: EventCompact, Step: step, Messages: r.transcript, Context: context, Usage: r.lastUsage}
+			if err := r.compactor.Compact(ctx, ev); err != nil {
+				return r.fail(fmt.Errorf("agentloop: compactor: %w", err))
+			}
+			if ev.Context != nil {
+				context = ev.Context
+			}
+			r.emit(&Event{Kind: EventCompact, Step: step, Messages: r.transcript, Context: context, Usage: r.lastUsage})
 		}
 
 		resp, err := r.infer(ctx, llm, context, r.generateOptions(forceFinal))
@@ -235,9 +266,12 @@ func (r *run) generateOptions(forceFinal bool) []llmhub.Option {
 }
 
 // accumulate folds one step's usage, reasoning, text, and timing into the
-// run totals.
+// run totals. lastUsage keeps the step's own usage (not the running sum):
+// its PromptTokens are the exact measured size of the view just sent, the
+// signal token-triggered compactors trip on.
 func (r *run) accumulate(resp *llmhub.Response) {
 	r.usage = addUsage(r.usage, resp.Usage)
+	r.lastUsage = resp.Usage
 	r.reasoning.WriteString(resp.ReasoningText())
 	r.lastText = resp.Text()
 

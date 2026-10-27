@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -244,23 +245,44 @@ func snippetCostCap(llm *llmhub.Client) {
 	_ = ag
 }
 
-// README: Writing your own agent (context rebuild via RebuildContext).
-func snippetRebuildContext(llm *llmhub.Client) {
-	const keep = 6 // never compress the most recent messages
+// README: Writing your own agent (context compaction via WithCompactor).
+func snippetCompactor(llm *llmhub.Client) {
+	ag := agentloop.MustNew(llm,
+		agentloop.WithSystemPrompt("You are a research assistant."),
+		agentloop.WithTools(clock),
+		agentloop.WithCompactor(agentloop.NewTokenCompactor(128000, 15000, 1)),
+	)
+	_ = ag
+}
 
-	hooks := agentloop.Hooks{
-		RebuildContext: func(ctx context.Context, ev *agentloop.Event) error {
-			if len(ev.Context) <= keep {
-				return nil
-			}
-			summary := summarize(ev.Context[:len(ev.Context)-keep]) // your summarizer
-			ev.Context = append([]*llmhub.Message{
-				llmhub.NewSystemMessage(llmhub.Text("Earlier steps, summarized: " + summary)),
-			}, ev.Context[len(ev.Context)-keep:]...)
-			return nil
-		},
+// README: Writing your own agent (writing your own Compactor). The
+// memoization guidance in the prose applies to real summarizers; this
+// skeleton shows the trigger, the wholesale replacement, and the tail.
+type summarizer struct {
+	llm *llmhub.Client
+}
+
+func (s *summarizer) Compact(ctx context.Context, ev *agentloop.Event) error {
+	if ev.Usage.PromptTokens < 100000 {
+		return nil // under the trip point: the no-op is the common case
 	}
-	ag := agentloop.MustNew(llm, agentloop.WithHooks(hooks))
+	summary, err := s.llm.Generate(ctx, []*llmhub.Message{
+		llmhub.NewUserMessage(llmhub.Text(
+			"Summarize the conversation so far in a few sentences: " +
+				messageText(ev.Messages))), // your prompt
+	})
+	if err != nil {
+		return err
+	}
+	ev.Context = append([]*llmhub.Message{
+		ev.Messages[0], // the system message, verbatim
+		llmhub.NewUserMessage(llmhub.Text("Earlier steps, summarized: " + summary.Text())),
+	}, ev.Messages[len(ev.Messages)-20:]...) // the recent tail, verbatim
+	return nil
+}
+
+func snippetCustomCompactor(llm *llmhub.Client) {
+	ag := agentloop.MustNew(llm, agentloop.WithCompactor(&summarizer{llm: llm}))
 	_ = ag
 }
 
@@ -391,6 +413,15 @@ func (q *steeringQueue) Take() []string {
 	return msgs
 }
 
-// summarize backs the RebuildContext recipe (a real caller would use a
-// model call).
-func summarize(msgs []*llmhub.Message) string { return fmt.Sprintf("%d earlier messages", len(msgs)) }
+// messageText backs the custom-Compactor recipe's prompt text.
+func messageText(msgs []*llmhub.Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		for _, part := range m.Content {
+			if tc, ok := part.(*llmhub.TextContent); ok {
+				b.WriteString(tc.Text)
+			}
+		}
+	}
+	return b.String()
+}
