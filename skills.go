@@ -54,6 +54,7 @@ const (
 	issueNULByte          = "NUL byte"
 	issueStegoStripped    = "unicode steganography stripped"
 	issueDuplicate        = "duplicate skill"
+	issueNotSkillsRoot    = "skill folder, not a skills root (pass its parent directory)"
 	issueUnreadableDir    = "unreadable directory"
 )
 
@@ -105,10 +106,15 @@ type SkillIssue struct {
 	Reason string
 }
 
-// LoadSkills scans the given directories in precedence order and returns
-// the valid skills plus the issues encountered on the way. Within and
-// across directories the first occurrence of a name wins; later
-// duplicates are reported as issues and never merged.
+// LoadSkills scans the given skills roots — directories whose immediate
+// children are skill folders — in precedence order and returns the valid
+// skills plus the issues encountered on the way. Within and across roots
+// the first occurrence of a name wins; later duplicates are reported as
+// issues and never merged. A skill folder itself (a directory containing
+// SKILL.md) is not a root: passed as an argument it loads nothing and is
+// reported as exactly one SkillIssue with the reason "skill folder, not
+// a skills root (pass its parent directory)" — pass the parent
+// directory instead.
 //
 // Loading is fail-closed: a skill folder that fails any check (frontmatter
 // structure, name regex and directory-name equality, description length,
@@ -141,6 +147,23 @@ func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error) {
 			issues = append(issues, SkillIssue{Dir: root, Reason: issueUnreadableDir})
 			continue
 		}
+		// Root-shape guard: a directory that itself contains SKILL.md is
+		// a skill folder, not a skills root — the documented convention
+		// puts SKILL.md one level down, in each child. Without this guard
+		// the mis-shaped argument degrades into misleading per-child
+		// "missing SKILL.md" issues, or into nothing at all for a bare
+		// folder. Report it once, distinctly, and move on to the next
+		// root. A legitimate root never contains a top-level SKILL.md
+		// file, so this cannot misfire; the IsDir check keeps a
+		// pathologically named SKILL.md directory a child-scan matter.
+		if info, err := os.Stat(filepath.Join(absRoot, skillFileName)); err == nil && !info.IsDir() {
+			issues = append(issues, SkillIssue{
+				Dir:    absRoot,
+				Name:   filepath.Base(absRoot),
+				Reason: issueNotSkillsRoot,
+			})
+			continue
+		}
 		names := make([]string, 0, len(entries))
 		byName := make(map[string]fs.DirEntry, len(entries))
 		for _, entry := range entries {
@@ -152,7 +175,7 @@ func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error) {
 			path := filepath.Join(absRoot, name)
 			info, err := os.Stat(path) // follows symlinks to directories
 			if err != nil {
-				issues = append(issues, SkillIssue{Dir: path, Reason: issueUnreadableDir})
+				issues = append(issues, SkillIssue{Dir: path, Name: filepath.Base(path), Reason: issueUnreadableDir})
 				continue
 			}
 			if !info.IsDir() {
@@ -160,7 +183,7 @@ func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error) {
 			}
 			resolved, err := filepath.EvalSymlinks(path)
 			if err != nil {
-				issues = append(issues, SkillIssue{Dir: path, Reason: issueUnreadableDir})
+				issues = append(issues, SkillIssue{Dir: path, Name: filepath.Base(path), Reason: issueUnreadableDir})
 				continue
 			}
 			skill, skillIssues, ok := loadOneSkill(resolved)
@@ -413,15 +436,17 @@ func escapesDir(rel string) bool {
 	return filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// WithSkills enables skills: it loads the skill folders found in the given
-// directories, in precedence order (the first occurrence of a name wins).
-// This is a construction-time option: New consumes the directories once,
-// appends the byte-stable "## Skills" catalog section to the system
-// prompt, and registers the skill_read tool; passing it to Ask or
-// AskStream has no effect. Invalid skill folders are fail-closed — they
-// are omitted and reported as SkillIssues by LoadSkills, never an error —
-// while a scan root that cannot be read at all (for example
-// permission-denied) fails construction.
+// WithSkills enables skills: it loads the skill folders found in the
+// given skills roots — directories whose immediate children are skill
+// folders — in precedence order (the first occurrence of a name wins).
+// Passing a skill folder itself instead of a root is fail-closed like any
+// other invalid input: it is reported as a SkillIssue by LoadSkills, and
+// construction proceeds without it. This is a construction-time option:
+// New consumes the directories once, appends the byte-stable
+// "## Skills" catalog section to the system prompt, and registers the
+// skill_read tool; passing it to Ask or AskStream has no effect. A scan
+// root that cannot be read at all (for example permission-denied) fails
+// construction.
 func WithSkills(dirs ...string) Option {
 	return func(c *config) { c.skillDirs = append(c.skillDirs, dirs...) }
 }

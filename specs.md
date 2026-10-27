@@ -191,7 +191,7 @@ WithDupCallLimit(n int) Option         // consecutive identical calls with ident
 WithStreamWatchdog(d time.Duration) Option // abort AskStream when no chunk arrives for d; default 90s; 0 disables
 WithHooks(h Hooks) Option              // hook callbacks (see §5.3)
 WithCompactor(c Compactor) Option      // bound context growth (see §5.3)
-WithSkills(dirs ...string) Option      // enable skills: catalog in prompt + skill_read tool (see §5.8)
+WithSkills(dirs ...string) Option      // enable skills from the given skills roots: catalog in prompt + skill_read tool (see §5.8)
 WithToolChoice(c llmhub.ToolChoice) Option // default llmhub.AutoToolChoice()
 WithGenerateOptions(opts ...llmhub.Option) Option // forwarded to every Generate/Stream (e.g. temperature, cache key)
 ```
@@ -651,22 +651,34 @@ type Skill struct {
 type SkillIssue struct {
     Dir    string
     Name   string // skill folder name; set for every rejected skill folder
-    Reason string // e.g. "bad frontmatter" (invalid YAML), "name mismatch", "empty body", "unicode steganography stripped"
+    Reason string // e.g. "bad frontmatter" (invalid YAML), "name mismatch", "empty body", "unicode steganography stripped", "skill folder, not a skills root (pass its parent directory)"
 }
 
-// LoadSkills scans dirs in precedence order (first occurrence of a name
-// wins; later duplicates are reported as issues, never merged). Validation:
-// YAML frontmatter (yaml.v3); name regex + equality with dirname; description
-// 1-1024 post-fold; body non-empty; NUL-byte check; strip Unicode Tags
-// (U+E0001–U+E007F) and bidi overrides (steganography defense).
+// LoadSkills scans skills roots — directories whose immediate children
+// are skill folders — in precedence order (first occurrence of a name
+// wins; later duplicates are reported as issues, never merged). A dir
+// that is itself a skill folder (contains SKILL.md) loads nothing and
+// yields exactly one issue with that stable reason — never an error.
+// Validation: YAML frontmatter (yaml.v3); name regex + equality with
+// dirname; description 1-1024 post-fold; body non-empty; NUL-byte check;
+// strip Unicode Tags (U+E0001–U+E007F) and bidi overrides (steganography
+// defense).
 func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error)
 
-WithSkills(dirs ...string) Option     // load + enable on an Agent/Conversation
+WithSkills(dirs ...string) Option     // load the given skills roots + enable on an Agent/Conversation
 WithPinnedSkills(names ...string) Option // bodies of ≤2 named skills inlined into the system prompt at construction (the sanctioned always-on exception)
 ```
 
 Mechanics:
 
+- **Roots:** `LoadSkills`/`WithSkills` take *skills roots* — directories
+  whose immediate children are skill folders. A dir containing
+  `SKILL.md` is a skill folder, not a root: it loads nothing, its
+  children are not scanned, and it yields exactly one `SkillIssue`
+  (reason `"skill folder, not a skills root (pass its parent directory)"`,
+  `Name` = the folder basename) — fail-closed, never an auto-accept and
+  never an error. A legitimate root never contains a top-level
+  `SKILL.md`, so valid roots behave exactly as before.
 - **Frontmatter.** `SKILL.md` frontmatter is parsed as real YAML with
   `gopkg.in/yaml.v3`: folded (`>`/`>-`/`>+`) and literal (`|`/`|-`) block
   scalars, quoted multi-line values, comments, nested maps (`metadata:`),
@@ -1059,7 +1071,7 @@ head/tail/sed, more selective grep, redirect to a file)
 
 The system template's wire contract is ported from mini-swe-agent's
 `config/default.yaml`, rendered with Go `text/template` instead of Jinja2;
-the task template's copy is the general-purpose mission (T018) built from
+the task template's copy is the general-purpose mission built from
 the surveyed harness patterns (`docs/harness-research.md` §5):
 
 - **System template:** "You are a general-purpose assistant that can

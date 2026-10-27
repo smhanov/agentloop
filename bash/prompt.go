@@ -41,7 +41,7 @@ Failure to follow these rules will cause your response to be rejected.
 // recommended workflow, the operational cautions, the persistence rules,
 // system information, an example response, and useful command examples.
 // The structure descends from mini's instance_template, but the copy is
-// the general-purpose mission (T018): neutral framing, a
+// the general-purpose mission: neutral framing, a
 // restate→gather→verify→record→submit workflow with an explicit
 // verification step, read-only investigation examples instead of file
 // editing recipes, and the report-after-marker line whose output lands in

@@ -482,6 +482,113 @@ func TestLoadSkillsRootIsFileIsIssueNotError(t *testing.T) {
 	}
 }
 
+// TestLoadSkillsRootShapeGuard pins the root-shape contract: LoadSkills
+// and WithSkills take skills roots — directories whose immediate children
+// are skill folders — and a skill folder passed as an argument is
+// reported once with a distinctive issue instead of degrading into
+// per-child "missing SKILL.md" noise (or a silent no-op), while valid
+// roots keep loading unchanged.
+func TestLoadSkillsRootShapeGuard(t *testing.T) {
+	t.Run("folder with subdirectories reported once", func(t *testing.T) {
+		folder := filepath.Join(skillTree(t, map[string]string{
+			"misplaced/SKILL.md":          skillMD("misplaced", "Use when misplaced.", "Body."),
+			"misplaced/references/doc.md": "doc",
+			"misplaced/assets/tpl.txt":    "template",
+			"misplaced/scripts/run.sh":    "#!/bin/sh\n",
+		}), "misplaced")
+		skills, issues, err := LoadSkills(folder)
+		if err != nil {
+			t.Fatalf("LoadSkills(skill folder): %v", err)
+		}
+		if len(skills) != 0 {
+			t.Fatalf("loaded %+v from a skill folder argument", skills)
+		}
+		if len(issues) != 1 {
+			t.Fatalf("got %d issues, want exactly 1 (no child-scan issues): %+v", len(issues), issues)
+		}
+		if issues[0].Reason != issueNotSkillsRoot {
+			t.Fatalf("reason = %q, want %q", issues[0].Reason, issueNotSkillsRoot)
+		}
+		if issues[0].Name != "misplaced" {
+			t.Fatalf("Name = %q, want the folder name", issues[0].Name)
+		}
+		if issues[0].Dir != folder {
+			t.Fatalf("Dir = %q, want the folder itself", issues[0].Dir)
+		}
+	})
+
+	t.Run("bare folder is no longer a silent no-op", func(t *testing.T) {
+		folder := filepath.Join(skillTree(t, map[string]string{
+			"bare/SKILL.md": skillMD("bare", "Use when bare.", "Body."),
+		}), "bare")
+		skills, issues, err := LoadSkills(folder)
+		if err != nil {
+			t.Fatalf("LoadSkills(bare skill folder): %v", err)
+		}
+		if len(skills) != 0 {
+			t.Fatalf("loaded %+v from a bare skill folder argument", skills)
+		}
+		if len(issues) != 1 || issues[0].Reason != issueNotSkillsRoot || issues[0].Name != "bare" {
+			t.Fatalf("issues = %+v, want exactly one %q issue for bare", issues, issueNotSkillsRoot)
+		}
+	})
+
+	t.Run("missing SKILL.md issue carries the folder name", func(t *testing.T) {
+		root := skillTree(t, map[string]string{
+			"empty-folder/README.md": "not a skill\n",
+		})
+		_, issues, err := LoadSkills(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(issues) != 1 || issues[0].Reason != issueMissingSkillMD {
+			t.Fatalf("issues = %+v, want one missing-SKILL.md issue", issues)
+		}
+		if issues[0].Name != "empty-folder" {
+			t.Fatalf("Name = %q, want the child folder name", issues[0].Name)
+		}
+	})
+
+	t.Run("unreadable child carries the folder name", func(t *testing.T) {
+		root := skillTree(t, map[string]string{
+			"healthy/SKILL.md": skillMD("healthy", "Use when healthy.", "Body."),
+		})
+		if err := os.Symlink(filepath.Join(root, "absent"), filepath.Join(root, "dangling")); err != nil {
+			t.Fatal(err)
+		}
+		skills, issues, err := LoadSkills(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(skills) != 1 || skills[0].Name != "healthy" {
+			t.Fatalf("loaded %+v, want only the healthy skill", skills)
+		}
+		if len(issues) != 1 || issues[0].Reason != issueUnreadableDir {
+			t.Fatalf("issues = %+v, want one unreadable-directory issue", issues)
+		}
+		if issues[0].Name != "dangling" {
+			t.Fatalf("Name = %q, want the child folder name", issues[0].Name)
+		}
+	})
+
+	t.Run("root argument still loads beside a folder argument", func(t *testing.T) {
+		tree := skillTree(t, map[string]string{
+			"skills/real/SKILL.md": skillMD("real", "Use when real.", "Real body."),
+			"misplaced/SKILL.md":   skillMD("misplaced", "Use when misplaced.", "Body."),
+		})
+		skills, issues, err := LoadSkills(filepath.Join(tree, "skills"), filepath.Join(tree, "misplaced"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(skills) != 1 || skills[0].Name != "real" {
+			t.Fatalf("loaded %+v, want the root's skill", skills)
+		}
+		if len(issues) != 1 || issues[0].Reason != issueNotSkillsRoot || issues[0].Name != "misplaced" {
+			t.Fatalf("issues = %+v, want one not-a-root issue for misplaced", issues)
+		}
+	})
+}
+
 func TestLoadSkillsPermissionDeniedIsSystemicError(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: permission checks do not apply")

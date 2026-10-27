@@ -172,7 +172,7 @@ The main flags (run `go run ./examples/ask -h` for the full list):
 | `-cache-key` | llmhub prompt-cache key — recommended with `-chat` |
 | `-serper-key` | Serper key (or `SERPER_API_KEY`); search agent only |
 | `-system` | replace the system prompt |
-| `-skills` | comma-separated skill directories to load |
+| `-skills` | comma-separated skills roots to load |
 | `-cwd`, `-env` | bash agent: working directory and extra `KEY=VALUE` entries (repeatable) |
 | `-step-limit`, `-token-limit` | bash agent limits |
 | `-confirm` | bash agent: prompt before every command (default: unattended) |
@@ -290,7 +290,7 @@ per-call options apply after the constructor's, so the later one wins.
 | `WithStreamWatchdog(d)` | 90s | Aborts `AskStream` when no chunk arrives for `d` (`ErrStreamStale`); 0 disables. |
 | `WithHooks(h)` | none | Hook callbacks — the extension surface ([Hooks](#hooks)). |
 | `WithCompactor(c)` | none | Installs a `Compactor` that bounds context growth; runs after `RebuildContext` before every call (see [Context compaction](#writing-your-own-agent)). |
-| `WithSkills(dirs ...)` | none | Enables skills: catalog in the prompt + `skill_read` tool. Construction-time only. |
+| `WithSkills(dirs ...)` | none | Enables skills from the given skills roots — directories whose immediate children are skill folders: catalog in the prompt + `skill_read` tool. Passing a skill folder itself is reported as a `SkillIssue`, not an error. Construction-time only. |
 | `WithPinnedSkills(names ...)` | none | Inlines up to two skill bodies into the system prompt. Construction-time only. |
 | `WithToolChoice(c)` | `llmhub.AutoToolChoice()` | Default tool-choice policy; the loop forces `llmhub.NoToolChoice()` itself when the tool budget is spent. |
 | `WithGenerateOptions(opts ...)` | none | llmhub options forwarded to every LLM call (temperature, cache key, …). Repeated uses append. |
@@ -572,18 +572,25 @@ discovers through a tiny catalog and loads on demand. Skills prepare,
 tools execute: a skill is not a native tool and not a second agent, and
 procedures never bloat the system prompt.
 
+Skills live in a *skills root* — a directory whose immediate children are
+skill folders:
+
 ```
-my-skill/
-  SKILL.md        # required: YAML frontmatter (name, description) + markdown body
-  references/     # optional deeper docs, loaded individually (L2)
-  assets/         # optional templates/data (L2)
-  scripts/        # optional executable helpers (L3 — run via an execution tool)
+skills-root/
+  my-skill/
+    SKILL.md        # required: YAML frontmatter (name, description) + markdown body
+    references/     # optional deeper docs, loaded individually (L2)
+    assets/         # optional templates/data (L2)
+    scripts/        # optional executable helpers (L3 — run via an execution tool)
+  other-skill/
+    SKILL.md
 ```
 
-Enable them with `agentloop.WithSkills("path/to/skills")` (any agent,
-preset, or conversation). At construction the loader scans the
-directories (first occurrence of a name wins), appends a byte-stable
-`## Skills` catalog to the system prompt, and registers one extra tool:
+Enable them with `agentloop.WithSkills("path/to/skills-root")` (any
+agent, preset, or conversation). At construction the loader scans each
+root's child folders (first occurrence of a name wins), appends a
+byte-stable `## Skills` catalog to the system prompt, and registers one
+extra tool:
 
 - **L0 Advertise** — one `- name: description` line per skill in the
   catalog (~100 tokens per skill, every call).
@@ -629,7 +636,12 @@ system prompt at construction (at most two; more fails with
 frontmatter, name/directory mismatch, oversized description, empty body)
 is omitted and reported as a `SkillIssue` by `agentloop.LoadSkills(dirs...)`
 — never an error, never a crash (only an unreadable scan root fails
-construction). As a prompt-injection defense, NUL bytes reject the skill,
+construction). The same goes for a shape mistake: passing a skill folder
+itself — a directory containing `SKILL.md` — where a skills root is
+expected loads nothing, scans no children, and yields exactly one
+`SkillIssue` (folder name in `Name`) with the stable reason
+`"skill folder, not a skills root (pass its parent directory)"`. As a
+prompt-injection defense, NUL bytes reject the skill,
 while Unicode Tags (U+E0001–U+E007F) and bidi overrides are stripped
 before validation — when stripping changed anything the skill loads and
 an advisory `SkillIssue` ("unicode steganography stripped") is recorded.
