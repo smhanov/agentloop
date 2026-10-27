@@ -496,24 +496,80 @@ func TestLoadSkillsPermissionDeniedIsSystemicError(t *testing.T) {
 	}
 }
 
+func TestLoadSkillsUnreadableScriptsIsIssue(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission checks do not apply")
+	}
+	root := skillTree(t, map[string]string{
+		"broken/SKILL.md":       skillMD("broken", "Use when unreadable.", "Body."),
+		"broken/scripts/run.sh": "#!/bin/sh\n",
+		"healthy/SKILL.md":      skillMD("healthy", "Use when healthy.", "Body."),
+	})
+	scripts := filepath.Join(root, "broken", "scripts")
+	if err := os.Chmod(scripts, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(scripts, 0o700) })
+
+	skills, issues, err := LoadSkills(root)
+	if err != nil {
+		t.Fatalf("LoadSkills: unexpected error: %v", err)
+	}
+	if len(skills) != 1 || skills[0].Name != "healthy" {
+		t.Fatalf("loaded %+v, want only the healthy skill", skills)
+	}
+	if len(issues) != 1 || issues[0].Reason != issueUnreadableDir || issues[0].Name != "broken" {
+		t.Fatalf("issues = %+v, want one unreadable-directory issue for broken", issues)
+	}
+}
+
 func TestLoadSkillsLinkedFiles(t *testing.T) {
 	root := skillTree(t, map[string]string{
-		"packer/SKILL.md":               skillMD("packer", "Use when packing.", "Body."),
-		"packer/references/setup.md":    "# Setup\nDetails.",
-		"packer/references/sub/deep.md": "deep",
-		"packer/assets/tpl.txt":         "template",
-		"packer/scripts/run.sh":         "#!/bin/sh\necho hi\n",
+		"packer/SKILL.md":                skillMD("packer", "Use when packing.", "Body."),
+		"packer/references/setup.md":     "# Setup\nDetails.",
+		"packer/references/sub/deep.md":  "deep",
+		"packer/assets/tpl.txt":          "template",
+		"packer/scripts/run.sh":          "#!/bin/sh\necho hi\n",
+		"packer/scripts/sub/bar.sh":      "#!/bin/sh\necho bar\n",
+		"plain/SKILL.md":                 skillMD("plain", "Use when plain.", "Plain body."),
+		"plain/references/only-doc.md":   "doc",
+		"plain/assets/only-template.txt": "template",
 	})
 	skills, _, err := LoadSkills(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(skills) != 1 {
+	if len(skills) != 2 {
 		t.Fatalf("loaded %+v", skills)
 	}
-	want := []string{"assets/tpl.txt", "references/setup.md", "references/sub/deep.md"}
-	if strings.Join(skills[0].LinkedFiles, ",") != strings.Join(want, ",") {
-		t.Fatalf("LinkedFiles = %v, want %v", skills[0].LinkedFiles, want)
+	byName := map[string]Skill{}
+	for _, s := range skills {
+		byName[s.Name] = s
+	}
+
+	packer := byName["packer"]
+	wantLinked := []string{"assets/tpl.txt", "references/setup.md", "references/sub/deep.md"}
+	if strings.Join(packer.LinkedFiles, ",") != strings.Join(wantLinked, ",") {
+		t.Fatalf("LinkedFiles = %v, want %v", packer.LinkedFiles, wantLinked)
+	}
+	wantScripts := []string{"scripts/run.sh", "scripts/sub/bar.sh"}
+	if strings.Join(packer.ScriptFiles, ",") != strings.Join(wantScripts, ",") {
+		t.Fatalf("ScriptFiles = %v, want %v", packer.ScriptFiles, wantScripts)
+	}
+	for _, script := range packer.ScriptFiles {
+		if contains(packer.LinkedFiles, script) {
+			t.Fatalf("script %q leaked into LinkedFiles: %v", script, packer.LinkedFiles)
+		}
+	}
+
+	// A missing scripts/ directory is fine: the skill loads unchanged with
+	// an empty ScriptFiles list.
+	plain := byName["plain"]
+	if len(plain.ScriptFiles) != 0 {
+		t.Fatalf("script-less skill has ScriptFiles = %v", plain.ScriptFiles)
+	}
+	if plain.Body != "Plain body." || len(plain.LinkedFiles) != 2 {
+		t.Fatalf("script-less skill changed: %+v", plain)
 	}
 }
 
@@ -521,17 +577,24 @@ func TestLoadSkillsSymlinks(t *testing.T) {
 	root := skillTree(t, map[string]string{
 		"real-skill/SKILL.md":        skillMD("real-skill", "Use when linked.", "Body."),
 		"real-skill/references/a.md": "aaa",
+		"real-skill/scripts/run.sh":  "#!/bin/sh\necho hi\n",
 		"outside/secret.txt":         "secret",
 	})
-	// Symlink the skill folder itself and one linked file to an outside
-	// target.
+	// Symlink the skill folder itself and one linked file and one script
+	// to an outside target.
 	if err := os.Symlink(filepath.Join(root, "real-skill"), filepath.Join(root, "linked-skill")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(filepath.Join(root, "outside", "secret.txt"), filepath.Join(root, "real-skill", "references", "escape.md")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Symlink(filepath.Join(root, "outside", "secret.txt"), filepath.Join(root, "real-skill", "scripts", "escape.sh")); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Symlink("a.md", filepath.Join(root, "real-skill", "references", "alias.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("run.sh", filepath.Join(root, "real-skill", "scripts", "alias.sh")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -554,6 +617,10 @@ func TestLoadSkillsSymlinks(t *testing.T) {
 	want := []string{"references/a.md"}
 	if strings.Join(skills[0].LinkedFiles, ",") != strings.Join(want, ",") {
 		t.Fatalf("LinkedFiles = %v, want %v", skills[0].LinkedFiles, want)
+	}
+	wantScripts := []string{"scripts/run.sh"}
+	if strings.Join(skills[0].ScriptFiles, ",") != strings.Join(wantScripts, ",") {
+		t.Fatalf("ScriptFiles = %v, want %v", skills[0].ScriptFiles, wantScripts)
 	}
 }
 
@@ -692,6 +759,60 @@ func TestSkillReadTool(t *testing.T) {
 	}
 }
 
+func TestSkillReadDisclosesBaseDirectoryAndScripts(t *testing.T) {
+	root := skillTree(t, map[string]string{
+		"scripted/SKILL.md":              skillMD("scripted", "Use when scripting.", "Scripted body."),
+		"scripted/scripts/search.py":     "print('hidden source')\n",
+		"scripted/scripts/sub/nested.sh": "#!/bin/sh\n",
+		"plain/SKILL.md":                 skillMD("plain", "Use when plain.", "Plain body."),
+		"plain/references/doc.md":        "doc",
+	})
+	agent := newFakeAgent(t, WithSkills(root))
+	tool := findTool(t, agent, "skill_read")
+	ctx := context.Background()
+
+	resolved := func(name string) string {
+		dir, err := filepath.EvalSymlinks(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	scriptedBody, err := tool.Run(ctx, json.RawMessage(`{"name":"scripted"}`))
+	if err != nil {
+		t.Fatalf("scripted body read: %v", err)
+	}
+	wantBase := "base directory: " + resolved("scripted") +
+		" (relative paths in this skill resolve from here)"
+	if !strings.Contains(scriptedBody, wantBase) {
+		t.Fatalf("body result missing base directory %q:\n%s", wantBase, scriptedBody)
+	}
+	wantScripts := "scripts (execute via your execution tool from the base directory; do not read):\n" +
+		"- scripts/search.py\n- scripts/sub/nested.sh"
+	if !strings.Contains(scriptedBody, wantScripts) {
+		t.Fatalf("body result missing script listing %q:\n%s", wantScripts, scriptedBody)
+	}
+	if strings.Contains(scriptedBody, "hidden source") {
+		t.Fatalf("script source leaked into the body result:\n%s", scriptedBody)
+	}
+
+	// A script-less skill keeps its previous rendering byte-for-byte: no
+	// footer and no scripts block.
+	plainBody, err := tool.Run(ctx, json.RawMessage(`{"name":"plain"}`))
+	if err != nil {
+		t.Fatalf("plain body read: %v", err)
+	}
+	wantPlain := "Plain body.\n\nlinked files (pass as skill_read's file argument):\n" +
+		"- references/doc.md"
+	if plainBody != wantPlain {
+		t.Fatalf("plain body result = %q, want %q", plainBody, wantPlain)
+	}
+	if strings.Contains(plainBody, "scripts (execute") {
+		t.Fatalf("script-less body result has a scripts block:\n%s", plainBody)
+	}
+}
+
 func TestSkillReadJail(t *testing.T) {
 	root := skillTree(t, map[string]string{
 		"alpha/SKILL.md":            skillMD("alpha", "Use when alpha.", "Alpha instructions."),
@@ -750,9 +871,10 @@ func TestSkillReadJail(t *testing.T) {
 
 func TestWithPinnedSkills(t *testing.T) {
 	root := skillTree(t, map[string]string{
-		"alpha/SKILL.md": skillMD("alpha", "Use when alpha.", "Alpha pinned body."),
-		"beta/SKILL.md":  skillMD("beta", "Use when beta.", "Beta pinned body."),
-		"gamma/SKILL.md": skillMD("gamma", "Use when gamma.", "Gamma body."),
+		"alpha/SKILL.md":         skillMD("alpha", "Use when alpha.", "Alpha pinned body."),
+		"alpha/scripts/hello.sh": "#!/bin/sh\necho hello\n",
+		"beta/SKILL.md":          skillMD("beta", "Use when beta.", "Beta pinned body."),
+		"gamma/SKILL.md":         skillMD("gamma", "Use when gamma.", "Gamma body."),
 	})
 
 	t.Run("cap of two enforced at construction", func(t *testing.T) {
@@ -781,6 +903,18 @@ func TestWithPinnedSkills(t *testing.T) {
 		}
 		if strings.Contains(prompt, "Gamma body.") {
 			t.Fatal("unpinned gamma body leaked into the prompt")
+		}
+		alphaDir, err := filepath.EvalSymlinks(filepath.Join(root, "alpha"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"base directory: " + alphaDir + " (relative paths in this skill resolve from here)",
+			"scripts (execute via your execution tool from the base directory; do not read):\n- scripts/hello.sh",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("pinned rendering missing %q:\n%s", want, prompt)
+			}
 		}
 		if idx := strings.Index(prompt, "## Skills"); idx > strings.Index(prompt, "## Skill: alpha (pinned)") {
 			t.Fatalf("pinned section rendered before the catalog:\n%s", prompt)

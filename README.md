@@ -578,7 +578,11 @@ directories (first occurrence of a name wins), appends a byte-stable
   page 1 and skip the rest, so instructional reads are never paginated.
 - **L3 Scripts** — no dedicated tool: scripts run through whatever
   execution tool the agent already has (the bash agent's `bash` tool);
-  only their output enters context.
+  only their output enters context. A skill that ships `scripts/` gains a
+  footer in its `skill_read` body result (and in the pinned-skill
+  rendering) with the skill's absolute base directory, the relative-path
+  semantics, and a run-don't-read listing of its `scripts/` entries;
+  script-less skills render exactly as before.
 
 **Authoring a skill.** The frontmatter takes `name` (must equal the
 directory name; lowercase letters/digits joined by single hyphens, 1–64
@@ -697,7 +701,9 @@ a reimplementation of
 [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)'s behavior
 on the unmodified agentloop core: same templates, same limits, same exit
 statuses, same submission mechanism. Built with
-[`WithSkills`](#skills), loaded scripts run through its `bash` tool (L3).
+[`WithSkills`](#skills), loaded scripts run through its `bash` tool (L3):
+the `skill_read` result discloses the skill's base directory and
+`scripts/` entries, and only the script's output enters context.
 
 ```go
 llm, _ := llmhub.New("zai", os.Getenv("ZAI_API_KEY"),

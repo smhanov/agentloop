@@ -541,6 +541,7 @@ type Skill struct {
     Body        string   // SKILL.md markdown below the frontmatter
     Dir         string   // resolved absolute path
     LinkedFiles []string // relative paths under references/ and assets/ (L2), precomputed so the model never needs to ls
+    ScriptFiles []string // relative paths under scripts/ (L3), advertised in skill_read for execution; never readable through it
 }
 
 // SkillIssue reports a skipped (fail-closed) skill directory and why.
@@ -595,11 +596,15 @@ Mechanics:
   so the model doesn't `ls`.
 - **Scripts (L3):** no dedicated execution tool. Skill scripts are run by
   whatever execution tool the agent already has (the bash preset's `bash`
-  tool); only command output enters context. In the skill catalog, script
-  paths are advertised so bodies can reference them. Agents without an
-  execution tool (e.g. the search preset) simply never run scripts —
-  their skills are procedures for *how to search/fetch*, not shell
-  scripts.
+  tool); only command output enters context. A skill that ships
+  `scripts/` gains a footer in its `skill_read` body result and in the
+  pinned-skill rendering, disclosing the absolute base directory, the
+  relative-path semantics, and a run-don't-read listing of its `scripts/`
+  entries, so bodies can reference them while the scripts stay unreadable
+  through `skill_read` (script-less skills render exactly as before).
+  Agents without an execution tool (e.g. the search preset) simply never
+  run scripts — their skills are procedures for *how to search/fetch*, not
+  shell scripts.
 - **Trust:** every loaded skill's instructions become authoritative for
   the model. v0 performs load-time sanitization only (NUL, Unicode Tags,
   bidi); install-time scanning, provenance hashes, and quarantine are

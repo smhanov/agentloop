@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -36,14 +37,38 @@ func skillMD(name, description, body string) string {
 }
 
 // fixtureSkillDir builds the one skill the composition tests use: its body
-// instructs writing greeting.txt, which the scripted model then "follows".
+// instructs writing greeting.txt and running the bundled script, which the
+// scripted model then "follows".
 func fixtureSkillDir(t *testing.T) string {
 	t.Helper()
 	return skillTree(t, map[string]string{
 		"greet-skill/SKILL.md": skillMD("greet-skill",
 			"Use when the task asks for a greeting.",
-			"Write a file named greeting.txt containing exactly: hello from the skill"),
+			"Write a file named greeting.txt containing exactly: hello from the skill\n\n"+
+				"To verify scripting, run the skill helper `scripts/hello.py` with Python "+
+				"from the skill's base directory; it writes script-ran.txt."),
+		"greet-skill/scripts/hello.py": "from pathlib import Path\n\n" +
+			"print(\"hello from the script\")\n" +
+			"Path(__file__).resolve().parent.parent.joinpath(\"script-ran.txt\").write_text(\"script ran\\n\")\n",
 	})
+}
+
+// shellQuote single-quotes s for the bash tool's command line.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// pythonInterpreter returns an available Python command for the script E2E
+// test, skipping when the host has none.
+func pythonInterpreter(t *testing.T) string {
+	t.Helper()
+	for _, name := range []string{"python3", "python"} {
+		if _, err := exec.LookPath(name); err == nil {
+			return name
+		}
+	}
+	t.Skip("no python3/python on PATH: the skill script E2E needs a Python interpreter")
+	return ""
 }
 
 // skillReadCall scripts a native skill_read tool call.
@@ -240,6 +265,144 @@ func TestSkillReadExecutesInBothProtocols(t *testing.T) {
 				t.Errorf("greeting.txt = %q, want %q", data, "hello from the skill")
 			}
 		})
+	}
+}
+
+// TestSkillScriptDisclosureExecutesInBothProtocols is the issue-#2 E2E:
+// the model learns the skill's absolute base directory and script names
+// from the skill_read result (never from the L0 catalog), then runs the
+// body-referenced script through the bash tool — both as an absolute path
+// and as a cd-prefixed relative path, in both transports. Only the script
+// output enters context; the source stays unreadable through skill_read.
+func TestSkillScriptDisclosureExecutesInBothProtocols(t *testing.T) {
+	const (
+		scriptOutput = "hello from the script"
+		endMark      = "script ran"
+	)
+	python := pythonInterpreter(t)
+
+	transports := []struct {
+		name string
+		tool bool
+	}{
+		{name: "text"},
+		{name: "tool", tool: true},
+	}
+	forms := []struct {
+		name    string
+		command func(skillDir string) string
+	}{
+		{
+			name: "absolute",
+			command: func(skillDir string) string {
+				return python + " " + shellQuote(filepath.Join(skillDir, "scripts", "hello.py"))
+			},
+		},
+		{
+			name: "cd",
+			command: func(skillDir string) string {
+				return "cd " + shellQuote(skillDir) + " && " + python + " scripts/hello.py"
+			},
+		},
+	}
+
+	for _, transport := range transports {
+		for _, form := range forms {
+			t.Run(transport.name+"/"+form.name, func(t *testing.T) {
+				skillRoot := fixtureSkillDir(t)
+				skillDir, err := filepath.EvalSymlinks(filepath.Join(skillRoot, "greet-skill"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				dir := t.TempDir()
+				command := form.command(skillDir)
+
+				var script []fakeTurn
+				if transport.tool {
+					script = []fakeTurn{
+						callTurn(skillReadCall("s1", "greet-skill")),
+						toolCallTurn("c1", command),
+						toolSubmitTurn(endMark),
+					}
+				} else {
+					script = []fakeTurn{
+						callTurn(skillReadCall("s1", "greet-skill")),
+						cmdTurn("THOUGHT: run the disclosed script", command),
+						submitTurn("THOUGHT: done", endMark),
+					}
+				}
+				resetScript(t, script...)
+
+				opts := []Option{
+					WithEnvironment(NewLocalEnvironment(dir, nil, 0)),
+					agentloop.WithSkills(skillRoot),
+				}
+				if transport.tool {
+					opts = append(opts, WithToolProtocol())
+				}
+				ans, err := newFakeAgent(t, opts...).Ask(context.Background(), "run the skill script")
+				if err != nil {
+					t.Fatalf("Ask: %v", err)
+				}
+				if ans.ExitStatus != ExitSubmitted || ans.Submission != endMark+"\n" {
+					t.Errorf("ExitStatus = %q, Submission = %q; want Submitted and %q",
+						ans.ExitStatus, ans.Submission, endMark+"\n")
+				}
+
+				// The L0 catalog stays path-free: disclosure happens only
+				// when a skill is actually loaded.
+				reqs := fakeRequests()
+				if len(reqs) == 0 {
+					t.Fatal("no provider requests captured")
+				}
+				if sys := systemOf(t, reqs[0]); strings.Contains(sys, skillDir) ||
+					strings.Contains(sys, "scripts/hello.py") {
+					t.Errorf("catalog/system prompt leaked the skill path:\n%s", sys)
+				}
+
+				// The load result — not the catalog — disclosed the base
+				// directory and the script path, and it never carried the
+				// script source.
+				var reads []string
+				for _, tr := range ans.Tools {
+					if tr.Name == "skill_read" {
+						reads = append(reads, tr.Output)
+					}
+				}
+				if len(reads) != 1 {
+					t.Fatalf("skill_read trace = %v, want one result", reads)
+				}
+				read := reads[0]
+				if want := "base directory: " + skillDir; !strings.Contains(read, want) {
+					t.Errorf("skill_read result missing %q:\n%s", want, read)
+				}
+				if !strings.Contains(read, "- scripts/hello.py") {
+					t.Errorf("skill_read result missing the script listing:\n%s", read)
+				}
+				if strings.Contains(read, "Path(__file__)") {
+					t.Errorf("script source leaked through skill_read:\n%s", read)
+				}
+
+				// The script ran: its output is the only part of it in the
+				// transcript...
+				observations := strings.Join(observationTexts(ans.Messages), "\n")
+				if !strings.Contains(observations, scriptOutput) {
+					t.Errorf("script output missing from the observations:\n%s", observations)
+				}
+				if strings.Contains(observations, "Path(__file__)") {
+					t.Errorf("script source leaked into the observations:\n%s", observations)
+				}
+
+				// ...and its side effect landed next to the skill.
+				data, err := os.ReadFile(filepath.Join(skillDir, "script-ran.txt"))
+				if err != nil {
+					t.Fatalf("the skill's script did not run: %v", err)
+				}
+				if string(data) != "script ran\n" {
+					t.Errorf("script-ran.txt = %q, want %q", data, "script ran\n")
+				}
+			})
+		}
 	}
 }
 

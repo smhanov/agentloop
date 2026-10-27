@@ -78,6 +78,13 @@ type Skill struct {
 	// they run via an execution tool and only their output enters
 	// context (L3).
 	LinkedFiles []string
+	// ScriptFiles lists the skill's executable helpers: relative slash
+	// paths under scripts/, precomputed like LinkedFiles (symlinks
+	// resolved, escapes dropped, sorted) so the body can reference them.
+	// They are advertised for execution, never for reading: run them
+	// through the agent's execution tool from Dir and only their output
+	// enters context (L3).
+	ScriptFiles []string
 }
 
 // SkillIssue reports a fail-closed outcome of skill loading: either a
@@ -230,12 +237,17 @@ func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
 	if err != nil {
 		return fail(issueUnreadableDir)
 	}
+	scripts, err := scriptFiles(dir)
+	if err != nil {
+		return fail(issueUnreadableDir)
+	}
 	return Skill{
 		Name:        name,
 		Description: description,
 		Body:        body,
 		Dir:         dir,
 		LinkedFiles: linked,
+		ScriptFiles: scripts,
 	}, issues, true
 }
 
@@ -340,9 +352,27 @@ func isHiddenChar(r rune) bool {
 // is sorted and deduplicated. Missing resource directories are fine (they
 // are optional); other walk errors are systemic and returned.
 func linkedFiles(dir string) ([]string, error) {
+	return skillFiles(dir, "references", "assets")
+}
+
+// scriptFiles lists the skill's executable helpers: every regular file
+// under scripts/, with the same resolution rules as linkedFiles. Missing
+// scripts/ is fine; other walk errors are systemic and returned, so an
+// unreadable scripts tree fails the skill rather than silently hiding
+// runnable helpers.
+func scriptFiles(dir string) ([]string, error) {
+	return skillFiles(dir, "scripts")
+}
+
+// skillFiles lists every regular file under the given optional
+// subdirectories of dir, as slash paths relative to dir. Symlinks are
+// resolved; files whose real location escapes dir are dropped, as are
+// symlinked directories. The result is sorted and deduplicated across all
+// listed subdirectories.
+func skillFiles(dir string, subs ...string) ([]string, error) {
 	var files []string
 	seen := make(map[string]bool)
-	for _, sub := range []string{"references", "assets"} {
+	for _, sub := range subs {
 		root := filepath.Join(dir, sub)
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -489,6 +519,9 @@ func renderPinnedSkills(pinned []Skill) string {
 	var b strings.Builder
 	for _, s := range pinned {
 		fmt.Fprintf(&b, "## Skill: %s (pinned)\n\n%s\n", s.Name, s.Body)
+		if len(s.ScriptFiles) > 0 {
+			fmt.Fprintf(&b, "\n%s\n", skillFooter(&s))
+		}
 	}
 	return b.String()
 }
@@ -567,14 +600,39 @@ func jsonPresent(raw json.RawMessage) bool {
 }
 
 // skillBodyWithFiles renders the tool result for a body read: the full
-// SKILL.md body followed by the linked-files list, so the model never has
-// to list the directory.
+// SKILL.md body, the linked-files list, and — for a skill that ships
+// scripts — the disclosure footer, so the model never has to list the
+// directory and can resolve skill-relative paths the body mentions.
 func skillBodyWithFiles(s *Skill) string {
-	if len(s.LinkedFiles) == 0 {
-		return s.Body
+	var b strings.Builder
+	b.WriteString(s.Body)
+	if len(s.LinkedFiles) > 0 {
+		b.WriteString("\n\nlinked files (pass as skill_read's file argument):\n- ")
+		b.WriteString(strings.Join(s.LinkedFiles, "\n- "))
 	}
-	return s.Body + "\n\nlinked files (pass as skill_read's file argument):\n- " +
-		strings.Join(s.LinkedFiles, "\n- ")
+	// Script-less skills keep their previous rendering byte-for-byte; the
+	// footer exists to make body-referenced scripts resolvable, and there
+	// is nothing to resolve without scripts/.
+	if len(s.ScriptFiles) > 0 {
+		b.WriteString("\n\n")
+		b.WriteString(skillFooter(s))
+	}
+	return b.String()
+}
+
+// skillFooter renders the disclosure appended to a loaded skill body that
+// ships scripts: the absolute base directory and the relative-path
+// semantics, plus a run-don't-read listing of its scripts/ entries.
+// Scripts stay unreadable through skill_read (L3): the listing is metadata
+// for the execution tool, and only the script's output enters context.
+func skillFooter(s *Skill) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "base directory: %s (relative paths in this skill resolve from here)", s.Dir)
+	if len(s.ScriptFiles) > 0 {
+		b.WriteString("\nscripts (execute via your execution tool from the base directory; do not read):\n- ")
+		b.WriteString(strings.Join(s.ScriptFiles, "\n- "))
+	}
+	return b.String()
 }
 
 // readSkillFile reads one linked file under the skill's references/ or
