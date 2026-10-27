@@ -63,12 +63,12 @@ already written for you.
 - **Transparent traces.** Every `Ask` returns the final text plus the
   complete trace: every tool execution with output and duration, the full
   message transcript, and token/cost usage.
-- **Plain Go, tiny footprint.** One dependency, one static binary:
-  agents compile with `CGO_ENABLED=0 go build` to any `GOOS`/`GOARCH`
-  and run in about 7 MB of RAM — no Python environment, no Node
-  sidecar, no container to babysit. Embed an agent in a CLI, a cron
-  job, an existing Go service, or a Raspberry Pi; between model calls
-  the loop itself is nearly free.
+- **Plain Go, tiny footprint.** Two small pure-Go dependencies, one
+  static binary: agents compile with `CGO_ENABLED=0 go build` to any
+  `GOOS`/`GOARCH` and run in about 7 MB of RAM — no Python environment,
+  no Node sidecar, no container to babysit. Embed an agent in a CLI, a
+  cron job, an existing Go service, or a Raspberry Pi; between model
+  calls the loop itself is nearly free.
 
 ## Installation
 
@@ -76,9 +76,10 @@ already written for you.
 go get github.com/smhanov/agentloop
 ```
 
-Go 1.21 or newer. The only dependency is llmhub; the search preset also
-wants a [serper.dev](https://serper.dev) API key at runtime (never at
-build time).
+Go 1.21 or newer. The library depends only on llmhub and the pure-Go
+[`gopkg.in/yaml.v3`](https://pkg.go.dev/gopkg.in/yaml.v3) frontmatter
+parser; the search preset also wants a
+[serper.dev](https://serper.dev) API key at runtime (never at build time).
 
 The full API reference — every exported type, option, and hook — lives
 on [pkg.go.dev](https://pkg.go.dev/github.com/smhanov/agentloop).

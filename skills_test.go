@@ -212,7 +212,7 @@ func TestLoadSkillsValidation(t *testing.T) {
 		{
 			label: "unknown frontmatter keys ignored",
 			files: map[string]string{
-				"extra-keys/SKILL.md": "---\nname: extra-keys\ndescription: Use when extra.\nallowed-tools: Bash\version: 3\n---\n\nBody.\n",
+				"extra-keys/SKILL.md": "---\nname: extra-keys\ndescription: Use when extra.\nallowed-tools: Bash\nversion: 3\n---\n\nBody.\n",
 			},
 			wantLoaded: 1,
 		},
@@ -227,6 +227,200 @@ func TestLoadSkillsValidation(t *testing.T) {
 					t.Fatalf("quoted value not unwrapped: %q", skills[0].Description)
 				}
 			},
+		},
+		{
+			label: "folded scalar keeps a single newline as a space",
+			files: map[string]string{
+				"folded/SKILL.md": "---\nname: folded\ndescription: >-\n  Use when folding\n  across lines.\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when folding across lines."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "folded scalar keeps a blank line as a newline",
+			files: map[string]string{
+				"folded-paragraph/SKILL.md": "---\nname: folded-paragraph\ndescription: >\n  Use when keeping.\n\n  A second paragraph.\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when keeping.\nA second paragraph."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "folded scalar with keep chomping trims trailing newlines",
+			files: map[string]string{
+				"folded-keep/SKILL.md": "---\nname: folded-keep\ndescription: >+\n  Use when keeping.\n\n  A second paragraph.\n\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when keeping.\nA second paragraph."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "literal scalar keeps newlines",
+			files: map[string]string{
+				"literal/SKILL.md": "---\nname: literal\ndescription: |\n  Use when literal.\n  Second line.\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when literal.\nSecond line."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "literal scalar with strip chomping",
+			files: map[string]string{
+				"literal-strip/SKILL.md": "---\nname: literal-strip\ndescription: |-\n  Use when stripped literal.\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when stripped literal."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "double-quoted multi-line scalar with escapes",
+			files: map[string]string{
+				"double-quoted/SKILL.md": "---\nname: double-quoted\ndescription: \"Use when double-quoted\n  over two lines with \\\"quotes\\\".\"\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := `Use when double-quoted over two lines with "quotes".`; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "single-quoted scalar with a colon and an escaped quote",
+			files: map[string]string{
+				"single-quoted/SKILL.md": "---\nname: single-quoted\ndescription: 'Use when single-quoted, with a colon: and it''s fine.'\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when single-quoted, with a colon: and it's fine."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "comments and blank lines in frontmatter",
+			files: map[string]string{
+				"commented/SKILL.md": "---\n# Catalog line comes next.\nname: commented  # the folder name\n\ndescription: Use when comments surround.\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when comments surround."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "nested metadata block map",
+			files: map[string]string{
+				"nested/SKILL.md": "---\nname: nested\ndescription: Use when nested maps appear.\nmetadata:\n  name: inner\n  version: 2\n  tags:\n    - one\n    - two\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if skills[0].Name != "nested" {
+					t.Fatalf("nested metadata clobbered the name: %q", skills[0].Name)
+				}
+				if want := "Use when nested maps appear."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "nested metadata flow map does not clobber name",
+			files: map[string]string{
+				"shadowed/SKILL.md": "---\nname: shadowed\ndescription: Use when shadowed.\nmetadata: {name: inner}\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if skills[0].Name != "shadowed" {
+					t.Fatalf("metadata flow map clobbered the name: %q", skills[0].Name)
+				}
+			},
+		},
+		{
+			label: "block and flow sequences in unknown keys",
+			files: map[string]string{
+				"sequences/SKILL.md": "---\nname: sequences\ndescription: Use when sequences appear.\nallowed-tools:\n  - Bash\n  - Read\ntags: [alpha, beta]\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when sequences appear."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+			},
+		},
+		{
+			label: "UTF-8 BOM and CRLF line endings",
+			files: map[string]string{
+				"crlf/SKILL.md": "\ufeff---\r\nname: crlf\r\ndescription: Use when CRLF.\r\n---\r\n\r\nBody.\r\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when CRLF."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+				if skills[0].Body != "Body." {
+					t.Fatalf("body = %q, want %q", skills[0].Body, "Body.")
+				}
+			},
+		},
+		{
+			label: "folded continuation with a colon keeps the folded text",
+			files: map[string]string{
+				"colon-demo/SKILL.md": "---\nname: colon-demo\ndescription: >-\n  Use when colon: inside folded\n  text must fold.\n---\n\nBody.\n",
+			},
+			wantLoaded: 1,
+			check: func(t *testing.T, skills []Skill) {
+				if want := "Use when colon: inside folded text must fold."; skills[0].Description != want {
+					t.Fatalf("description = %q, want %q", skills[0].Description, want)
+				}
+				if strings.TrimSpace(skills[0].Description) == ">-" {
+					t.Fatal("marker string loaded as the description")
+				}
+			},
+		},
+		{
+			label: "non-map YAML root",
+			files: map[string]string{
+				"sequence-root/SKILL.md": "---\n- name: sequence-root\n- description: Use when sequence root.\n---\n\nBody.\n",
+			},
+			wantIssues: []string{issueBadFrontmatter},
+		},
+		{
+			label: "non-string name scalar",
+			files: map[string]string{
+				"bool-name/SKILL.md": "---\nname: true\ndescription: Use when bool.\n---\n\nBody.\n",
+			},
+			wantIssues: []string{issueBadFrontmatter},
+		},
+		{
+			label: "non-string description scalar",
+			files: map[string]string{
+				"int-desc/SKILL.md": "---\nname: int-desc\ndescription: 42\n---\n\nBody.\n",
+			},
+			wantIssues: []string{issueBadFrontmatter},
+		},
+		{
+			label: "oversized frontmatter rejected before parsing",
+			files: map[string]string{
+				"huge-frontmatter/SKILL.md": "---\nname: huge-frontmatter\ndescription: Use when huge.\n" +
+					"padding: " + strings.Repeat("x", 64<<10) + "\n---\n\nBody.\n",
+			},
+			wantIssues: []string{issueBadFrontmatter},
 		},
 	}
 
@@ -248,6 +442,9 @@ func TestLoadSkillsValidation(t *testing.T) {
 			for _, issue := range issues {
 				if issue.Dir == "" {
 					t.Fatalf("issue %+v has empty Dir", issue)
+				}
+				if want := filepath.Base(issue.Dir); issue.Name != want {
+					t.Fatalf("issue %+v: Name = %q, want folder basename %q", issue, issue.Name, want)
 				}
 			}
 			if tc.check != nil {

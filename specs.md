@@ -548,14 +548,14 @@ type Skill struct {
 // an error, never a crash (fail-closed loading).
 type SkillIssue struct {
     Dir    string
-    Name   string
-    Reason string // e.g. "bad frontmatter", "name mismatch", "empty body", "unicode steganography stripped"
+    Name   string // skill folder name; set for every rejected skill folder
+    Reason string // e.g. "bad frontmatter" (invalid YAML), "name mismatch", "empty body", "unicode steganography stripped"
 }
 
 // LoadSkills scans dirs in precedence order (first occurrence of a name
 // wins; later duplicates are reported as issues, never merged). Validation:
-// frontmatter structure; name regex + equality with dirname; description
-// 1-1024; body non-empty; NUL-byte check; strip Unicode Tags
+// YAML frontmatter (yaml.v3); name regex + equality with dirname; description
+// 1-1024 post-fold; body non-empty; NUL-byte check; strip Unicode Tags
 // (U+E0001–U+E007F) and bidi overrides (steganography defense).
 func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error)
 
@@ -565,6 +565,17 @@ WithPinnedSkills(names ...string) Option // bodies of ≤2 named skills inlined 
 
 Mechanics:
 
+- **Frontmatter.** `SKILL.md` frontmatter is parsed as real YAML with
+  `gopkg.in/yaml.v3`: folded (`>`/`>-`/`>+`) and literal (`|`/`|-`) block
+  scalars, quoted multi-line values, comments, nested maps (`metadata:`),
+  and block/flow sequences all load, and unknown keys are ignored. `name`
+  and `description` must be strings — a bool, number, sequence, or map is
+  `"bad frontmatter"`, as is a non-map document or invalid YAML (the
+  stable reason string now means genuinely malformed YAML). A UTF-8 BOM
+  and CRLF/CR endings are normalized, the block is capped at 64 KB before
+  parsing, and the description cap is measured on the post-fold string.
+  Every rejected skill folder carries its folder name in
+  `SkillIssue.Name`, so headless consumers can tell which skills dropped.
 - **Catalog (L0):** `WithSkills` appends a `## Skills` section to the
   system prompt — one `- name: description` line per skill, byte-stable
   for the lifetime of the Agent/Conversation (frozen at construction;

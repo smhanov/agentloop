@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/smhanov/llmhub"
+	"gopkg.in/yaml.v3"
 )
 
 // Skill-file conventions and validation limits (specs.md §5.8).
@@ -29,6 +30,10 @@ const (
 	// maxPinnedSkills bounds WithPinnedSkills: at most two bodies may be
 	// inlined into the system prompt.
 	maxPinnedSkills = 2
+	// maxFrontmatterBytes caps the YAML frontmatter block before parsing,
+	// a cheap guard against pathological alias or nesting expansion in a
+	// hand-authored pack.
+	maxFrontmatterBytes = 64 << 10
 )
 
 // skillNameRe matches a valid skill name: lowercase alphanumerics joined
@@ -83,7 +88,9 @@ type SkillIssue struct {
 	// Dir is the skill directory the issue refers to (the scan root
 	// itself when the directory could not be scanned).
 	Dir string
-	// Name is the skill name, when one could be determined.
+	// Name is the skill folder name, populated for every rejection of a
+	// specific skill folder so a dropped skill stays identifiable. It is
+	// empty only for issues about the scan root itself.
 	Name string
 	// Reason is a short stable string, e.g. "bad frontmatter",
 	// "name mismatch", "empty body", "duplicate skill", or
@@ -172,7 +179,7 @@ func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error) {
 func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
 	var issues []SkillIssue
 	fail := func(reason string) (Skill, []SkillIssue, bool) {
-		return Skill{}, append(issues, SkillIssue{Dir: dir, Reason: reason}), false
+		return Skill{}, append(issues, SkillIssue{Dir: dir, Name: filepath.Base(dir), Reason: reason}), false
 	}
 
 	raw, err := os.ReadFile(filepath.Join(dir, skillFileName))
@@ -195,8 +202,9 @@ func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
 	// Steganography defense: strip invisible characters, then validate the
 	// sanitized values. When stripping changed anything, record an
 	// advisory and continue with the clean content.
-	name, changed1 := stripHiddenChars(fields["name"])
-	description, changed2 := stripHiddenChars(fields["description"])
+	name, changed1 := stripHiddenChars(string(fields.Name))
+	description, changed2 := stripHiddenChars(string(fields.Description))
+	description = strings.TrimSpace(description)
 	strippedBody, changed3 := stripHiddenChars(bodyRaw)
 	if changed1 || changed2 || changed3 {
 		issues = append(issues, SkillIssue{Dir: dir, Name: name, Reason: issueStegoStripped})
@@ -231,45 +239,66 @@ func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
 	}, issues, true
 }
 
+// skillFrontmatter is the subset of SKILL.md YAML frontmatter the loader
+// consumes: name and description. Unknown keys — including nested maps
+// such as metadata — are ignored by the non-strict decode.
+type skillFrontmatter struct {
+	Name        yamlString `yaml:"name"`
+	Description yamlString `yaml:"description"`
+}
+
+// yamlString is a frontmatter scalar that must be a string or null.
+// yaml.v3 decodes non-string scalars (bool, int) into a Go string field by
+// taking their literal text; for the fields that drive validation that
+// coercion is a frontmatter error, so the tag is checked explicitly.
+type yamlString string
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (s *yamlString) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!null" {
+		*s = ""
+		return nil
+	}
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+		return fmt.Errorf("frontmatter: expected a string, got %s", node.Tag)
+	}
+	*s = yamlString(node.Value)
+	return nil
+}
+
 // parseFrontmatter splits a SKILL.md into its frontmatter fields and the
-// markdown body below the closing delimiter. The hand-rolled parser
-// accepts exactly: an opening "---" line, "key: value" lines (one level,
-// values optionally double-quoted; keys other than name and description
-// are ignored), and a closing "---" line. Anything else reports ok=false.
-func parseFrontmatter(content string) (fields map[string]string, body string, ok bool) {
+// markdown body below the closing delimiter. The block between the
+// opening and closing "---" lines is parsed as real YAML
+// (gopkg.in/yaml.v3), as the Agent Skills spec requires: folded and
+// literal block scalars, quoted multi-line values, comments, nested maps,
+// block and flow sequences, and unknown keys all load; only name and
+// description are consumed. UTF-8 BOMs are dropped and CRLF/CR line
+// endings normalized first. Anything that is not a YAML mapping of string
+// name/description values — missing or unclosed delimiters, invalid YAML,
+// a block over maxFrontmatterBytes, or a non-string field — reports
+// ok=false.
+func parseFrontmatter(content string) (fields skillFrontmatter, body string, ok bool) {
 	content = strings.TrimPrefix(content, "\ufeff")
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
 	lines := strings.Split(content, "\n")
-	if len(lines) == 0 || strings.TrimSuffix(lines[0], "\r") != "---" {
-		return nil, "", false
+	if len(lines) == 0 || lines[0] != "---" {
+		return skillFrontmatter{}, "", false
 	}
-	fields = make(map[string]string)
-	closed := false
-	i := 1
-	for ; i < len(lines); i++ {
-		line := strings.TrimSuffix(lines[i], "\r")
-		if line == "---" {
-			closed = true
-			i++
-			break
-		}
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		key, value, found := strings.Cut(line, ":")
-		if !found {
-			return nil, "", false
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
-			value = value[1 : len(value)-1]
-		}
-		fields[key] = value
+	end := 1
+	for ; end < len(lines) && lines[end] != "---"; end++ {
 	}
-	if !closed {
-		return nil, "", false
+	if end == len(lines) {
+		return skillFrontmatter{}, "", false
 	}
-	return fields, strings.Join(lines[i:], "\n"), true
+	block := strings.Join(lines[1:end], "\n")
+	if len(block) > maxFrontmatterBytes {
+		return skillFrontmatter{}, "", false
+	}
+	if err := yaml.Unmarshal([]byte(block), &fields); err != nil {
+		return skillFrontmatter{}, "", false
+	}
+	return fields, strings.Join(lines[end+1:], "\n"), true
 }
 
 // stripHiddenChars removes the invisible characters used in steganographic
