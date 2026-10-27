@@ -186,6 +186,21 @@ func snippetBashAgent() {
 	_, _ = ans, err
 }
 
+// README: Specializing the bash agent (coding-agent task-template override).
+func snippetSpecializeBashAgent(llm *llmhub.Client) {
+	const sweTask = "Please solve this issue: {{.Task}}\n\n" +
+		"You can execute bash commands and edit files to implement the necessary changes.\n" +
+		"Work step by step: analyze the codebase, reproduce the problem, fix it,\n" +
+		"and verify with the project's tests before submitting.\n\n" +
+		"Finish by issuing this command alone: `echo {{.SubmitMarker}}`.\n" +
+		"On the lines after it, summarize the change.\n"
+
+	agent, _ := bash.New(llm,
+		bash.WithTemplates("", sweTask, ""), // system and observation keep the defaults
+	)
+	_ = agent
+}
+
 // README: Writing your own agent (text-action protocol via the finish veto).
 func snippetFinishVeto(llm *llmhub.Client) {
 	hooks := agentloop.Hooks{

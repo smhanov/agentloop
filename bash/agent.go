@@ -1,11 +1,14 @@
-// Package bash implements the mini-swe-agent-compatible coding preset: a
-// coding agent that solves tasks by executing shell commands in an
-// Environment until it reports completion. The templates, limits, exit
-// statuses, and submission mechanism follow mini-swe-agent; the loop itself
-// is the unmodified agentloop core. Two transports drive it: the default
-// text-action protocol (an AfterGenerate finish veto keeps the run going
-// without native tool calls) and WithToolProtocol's native `bash` tool —
-// same observations, limits, and exit statuses, different wire format.
+// Package bash implements the general-purpose shell preset: an agent that
+// completes tasks by executing shell commands in an Environment until it
+// reports completion. The wire protocol, limits, exit statuses, and
+// submission mechanism descend from mini-swe-agent; the default templates
+// are domain-neutral, and specializations (a coding agent, for example)
+// inject their own mission via WithTemplates or swap the persona with
+// agentloop.WithSystemPrompt. The loop itself is the unmodified agentloop
+// core. Two transports drive it: the default text-action protocol (an
+// AfterGenerate finish veto keeps the run going without native tool
+// calls) and WithToolProtocol's native `bash` tool — same observations,
+// limits, and exit statuses, different wire format.
 package bash
 
 import (
@@ -131,14 +134,18 @@ func WithOutputLimit(n int) Option {
 	return agentloop.WithSetting(settingOutputLimit, n)
 }
 
-// WithTemplates overrides the ported mini-swe-agent templates (rendered
-// with text/template): the system prompt, the first user message (task),
-// and the per-command observation layout. Empty strings keep the
-// corresponding default. Task templates receive Task, SubmitMarker, GOOS,
-// GOARCH, Hostname, and IsDarwin; observation templates receive Exception,
-// ReturnCode, Output, TooLong, Head, Tail, and Elided. The system template
-// renders once at construction — a system override only takes effect when
-// passed to New, while task and observation overrides also work per Ask.
+// WithTemplates overrides the preset's default templates (rendered with
+// text/template): the system prompt, the first user message (task), and
+// the per-command observation layout. The defaults are domain-neutral; a
+// task-template override is how a specialization (coding agent, data
+// pipeline, …) injects its own mission — keep the `{{.SubmitMarker}}` echo
+// command in it, or the run cannot finish as Submitted. Empty strings keep
+// the corresponding default. Task templates receive Task, SubmitMarker,
+// GOOS, GOARCH, Hostname, and IsDarwin; observation templates receive
+// Exception, ReturnCode, Output, TooLong, Head, Tail, and Elided. The
+// system template renders once at construction — a system override only
+// takes effect when passed to New, while task and observation overrides
+// also work per Ask.
 func WithTemplates(system, task, observation string) Option {
 	return agentloop.WithSetting(settingTemplates, templateOverrides{
 		system: system, task: task, observation: observation,
@@ -181,7 +188,7 @@ func WithHooks(h agentloop.Hooks) Option {
 }
 
 // templateOverrides carries the WithTemplates values; empty fields keep
-// the ported defaults.
+// the defaults.
 type templateOverrides struct {
 	system      string
 	task        string
@@ -280,7 +287,7 @@ func hardStepCeiling(stepLimit int) int {
 	return max(stepLimit, floor)
 }
 
-// Agent is the bash coding preset: an immutable wrapper around the core
+// Agent is the bash shell preset: an immutable wrapper around the core
 // agentloop.Agent wiring the selected action protocol (text or native
 // tool), the limits, and the approval gate. Safe for concurrent use.
 type Agent struct {
@@ -289,7 +296,7 @@ type Agent struct {
 	sys   systemData
 }
 
-// New returns a coding agent that executes bash commands in an Environment
+// New returns a shell agent that executes bash commands in an Environment
 // until the task is submitted or a limit is hit. The default protocol is
 // mini-swe-agent's text-action protocol. Core options passed in opts
 // (budgets, skills, …) apply after the preset defaults, so later options

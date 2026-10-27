@@ -16,9 +16,10 @@ The library ships with two built-in presets assembled entirely from the core
 loop's public surface — no preset-specific hacks in the core:
 
 - **Search agent** — grounds answers in Serper web-search results.
-- **Bash coding agent** — solves tasks by executing shell commands in a
-  workspace; protocol-compatible with
-  [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (§8).
+- **Bash shell agent** — completes tasks by executing shell commands in a
+  workspace; wire protocol, limits, and exit statuses descend from
+  [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent), with
+  domain-neutral default templates (§8).
 
 All LLM access goes through
 [`github.com/smhanov/llmhub`](https://github.com/smhanov/llmhub); agentloop
@@ -72,7 +73,7 @@ research pipeline; use agentloop when you want to build your own agent.
 - First-class **multi-turn conversations** (`Conversation`, §5.5).
 - **Multiple parallel tool calls** per step, bounded and order-preserving
   (§5.2).
-- At least two built-in presets (search, bash coding) to enforce and
+- At least two built-in presets (search, bash shell) to enforce and
   demonstrate generality.
 - **Skills** with progressive disclosure (L0–L3 invariant,
   `docs/references.md` §7): procedures live in skill folders, not native
@@ -153,7 +154,7 @@ agentloop/          github.com/smhanov/agentloop — the core loop
     agent.go        New, Agent, Answer, Source, Sources
     serper.go       Serper client, Searcher/Fetcher interfaces, response mapping
     prompt.go       default system prompt, tool declarations
-  bash/             github.com/smhanov/agentloop/bash — coding preset (§8)
+  bash/             github.com/smhanov/agentloop/bash — shell preset (§8)
     agent.go        New, Agent, Answer, protocols, limits, templates,
                     action parser, observation formatter
     environment.go  Environment interface, ExecResult, NewLocalEnvironment
@@ -891,17 +892,19 @@ commands, paths, and conclusions), and returns compact JSON:
 tool) produce a `{"error": "invalid arguments"}` tool result (counts
 against budget). Both count against `MaxToolCalls`.
 
-## 8. Bash Coding Preset — `agentloop/bash` (mini-swe-agent compatible)
+## 8. Bash Shell Preset — `agentloop/bash` (mini-swe-agent wire heritage)
 
-The second built-in preset — a coding agent that solves tasks by executing
-shell commands in a workspace until it reports completion. It behaves the
-same way as [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)
-(the Princeton/Stanford "100-line agent"): same protocol, same templates,
-same limits and exit statuses, same submission mechanism — reimplemented on
-the unmodified agentloop core using only `Tool`, `Hooks`, and `Options`.
-This preset exists to **enforce generality**: the core loop must express a
-long-running command-execution agent just as naturally as a one-shot search
-agent.
+The second built-in preset — a general-purpose shell agent that completes
+tasks by executing shell commands in a workspace until it reports
+completion. Its wire protocol, limits, exit statuses, and submission
+mechanism descend from
+[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (the
+Princeton/Stanford "100-line agent"); the default templates are
+domain-neutral — any task, coding included, is a template override away
+(§8.5). Reimplemented on the unmodified agentloop core using only `Tool`,
+`Hooks`, and `Options`. This preset exists to **enforce generality**: the
+core loop must express a long-running command-execution agent just as
+naturally as a one-shot search agent.
 
 ### 8.1 API
 
@@ -910,7 +913,7 @@ package bash // import "github.com/smhanov/agentloop/bash"
 
 type Option = agentloop.Option // core and preset options compose together
 
-// New returns a coding agent that executes bash commands in an
+// New returns a shell agent that executes bash commands in an
 // Environment until the task is submitted or a limit is hit.
 // Default protocol is mini-swe-agent's text-action protocol (§8.3).
 func New(llm *llmhub.Client, opts ...Option) (*Agent, error)
@@ -998,10 +1001,10 @@ func NewLocalEnvironment(cwd string, env []string, timeout time.Duration) Enviro
 responds with plain text containing exactly one fenced bash block:
 
 ````
-THOUGHT: reasoning about the next step…
+THOUGHT: I need the line count before comparing the two files.
 
 ```mswea_bash_command
-sed -i 's/old/new/g' main.go
+wc -l notes.txt
 ```
 ````
 
@@ -1054,25 +1057,38 @@ head/tail/sed, more selective grep, redirect to a file)
 
 ### 8.5 Default templates
 
-Ported from mini-swe-agent's `config/default.yaml`, rendered with Go
-`text/template` instead of Jinja2 (same variables where applicable):
+The system template's wire contract is ported from mini-swe-agent's
+`config/default.yaml`, rendered with Go `text/template` instead of Jinja2;
+the task template's copy is the general-purpose mission (T018) built from
+the surveyed harness patterns (`docs/harness-research.md` §5):
 
-- **System template:** "You are a helpful assistant that can interact with
-  a computer… exactly ONE bash code block with ONE command… include a
-  THOUGHT section…", with the `<format_example>` block.
-- **Instance/task template:** "Please solve this issue: {{.Task}}", the
-  recommended workflow (analyze → reproduce → fix → verify → edge cases →
-  submit), the persistence rules (every action runs in a new subshell),
-  `<system_information>` filled from `runtime.GOOS`/`GOARCH`/hostname, the
-  example response, and the useful-command examples (heredoc file creation,
-  sed edits, `nl -ba | sed -n` viewing).
+- **System template:** "You are a general-purpose assistant that can
+  interact with a computer… exactly ONE bash code block with ONE command…
+  include a THOUGHT section…", with the `<format_example>` block and the
+  rejection rule. The `mswea_bash_command` fence name is kept (wire
+  identifier, not mission text).
+- **Instance/task template:** "Complete this task: {{.Task}}" plus the
+  unattended-runs ending discipline (every response ends with the next
+  command or the submit marker), the recommended workflow (restate the
+  objective → gather information one command at a time → **verify** every
+  important claim against a second source → record findings to a notes
+  file → submit), the submit block (marker mechanics verbatim, plus the
+  report-after-marker line whose output lands in `Answer.Submission`),
+  the operational cautions (answer questions without mutating the
+  environment; avoid interactive input; kill by exact PID; keep output
+  under the truncation limit), the persistence rules (every action runs
+  in a new subshell), `<system_information>` filled from
+  `runtime.GOOS`/`GOARCH`/hostname (with a macOS note when `IsDarwin`),
+  the example response, and read-only investigation command examples
+  (`find`/`grep`/`head`/`tail`, `git --no-pager`, `ps`).
 - **Observation template:** §8.4.
 - **Format-error template:** mini's two variants — the finish_reason
   truncation hint ("respond more concisely…") and the "found N actions,
   exactly one expected" guidance.
 
-macOS `sed -i ''` note and the `TRIPLEBACKTICKSBASH` escape hatch are
-included for compatibility (§17).
+Specialized missions (coding included) override the task template — or
+the whole set — via `WithTemplates` (§8.1); the TRIPLEBACKTICKSBASH
+escape hatch stays for wire compatibility (§17).
 
 ### 8.6 Limits and exit statuses (mapping table)
 
@@ -1401,7 +1417,7 @@ go run ./examples/ask \
   -stream
 ```
 
-Bash preset (coding agent, mini-swe-agent style):
+Bash preset (shell agent, mini-swe-agent wire heritage):
 
 ```bash
 go run ./examples/ask \
@@ -1419,7 +1435,7 @@ go run ./examples/ask \
 | `-model` | model identifier |
 | `-api-key` | LLM API key (or provider env vars) |
 | `-base-url` | provider base URL override |
-| `-agent` | `search` (default; web_search + Serper), `bash` (coding agent, §8), or `plain` (no tools — the core loop bare) |
+| `-agent` | `search` (default; web_search + Serper), `bash` (shell agent, §8), or `plain` (no tools — the core loop bare) |
 | `-chat` | interactive multi-turn mode: after each answer, read the next prompt from stdin (blank line or Ctrl-D exits); one `Conversation`, shared history |
 | `-cache-key` | llmhub prompt-cache key — recommended with `-chat` (§5.5) |
 | `-serper-key` | Serper key (or `SERPER_API_KEY`); search agent only |

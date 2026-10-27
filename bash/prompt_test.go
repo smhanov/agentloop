@@ -134,8 +134,8 @@ func TestFormatErrorTemplateVariants(t *testing.T) {
 	}
 }
 
-// TestDefaultTemplatesAreFinanciallyNeutral: the ported templates carry
-// only generic coding-agent content (repo hygiene rule).
+// TestDefaultTemplatesAreFinanciallyNeutral: the shipped templates carry
+// only domain-neutral content (repo hygiene rule).
 func TestDefaultTemplatesAreFinanciallyNeutral(t *testing.T) {
 	for name, text := range map[string]string{
 		"system":      defaultSystemTemplate,
@@ -151,39 +151,120 @@ func TestDefaultTemplatesAreFinanciallyNeutral(t *testing.T) {
 	}
 }
 
-// TestRenderSystemAndTask pins the ported prompt shapes: the system
-// template shows the format example; the task template carries the task,
-// the submit marker, and the system information block.
+// TestRenderSystemAndTask pins the prompt shapes: the system template
+// keeps the wire contract (ONE block, THOUGHT, format example, rejection
+// rule) with a neutral role line, and the task template carries the
+// general-purpose mission — neutral framing, the gather→verify→record
+// workflow with an explicit verification step, the submit-marker block
+// with the report-after-marker line, the Important Rules, and the system
+// information block — and no coding-specific copy.
 func TestRenderSystemAndTask(t *testing.T) {
 	sys := newSystemData()
 	system, err := renderSystem(defaultSystemTemplate, sys)
 	if err != nil {
 		t.Fatalf("render system: %v", err)
 	}
-	for _, want := range []string{"exactly ONE bash code block", fence + "mswea_bash_command", "<format_example>"} {
+	for _, want := range []string{
+		"general-purpose assistant",
+		"exactly ONE bash code block",
+		"THOUGHT",
+		fence + "mswea_bash_command",
+		"<format_example>",
+		"Failure to follow these rules will cause your response to be rejected.",
+	} {
 		if !strings.Contains(system, want) {
 			t.Errorf("system prompt missing %q", want)
 		}
 	}
 
 	task, err := renderTask(defaultTaskTemplate, taskData{
-		Task: "Fix the bug in widget.go", SubmitMarker: defaultSubmitMarker, GOOS: sys.GOOS, GOARCH: sys.GOARCH, Hostname: sys.Hostname, IsDarwin: sys.IsDarwin,
+		Task: "Count the files in the current directory", SubmitMarker: defaultSubmitMarker,
+		GOOS: sys.GOOS, GOARCH: sys.GOARCH, Hostname: sys.Hostname, IsDarwin: sys.IsDarwin,
 	})
 	if err != nil {
 		t.Fatalf("render task: %v", err)
 	}
 	for _, want := range []string{
-		"Please solve this issue: Fix the bug in widget.go",
+		// Neutral framing.
+		"Complete this task: Count the files in the current directory",
+		// Ending discipline (unattended runs).
+		"every response must end with the next command or the submit marker",
+		// Workflow: restate → gather → verify → record → submit.
+		"1. Restate the objective",
+		"2. Gather information one command at a time",
+		"3. Verify before you report",
+		"4. Record what you learn in a notes file",
+		// Operational cautions.
+		"Do not modify the environment to change the answer",
+		"Kill processes by their exact PID",
+		// Submit block: marker mechanics verbatim + report-after-marker line.
 		"echo " + defaultSubmitMarker,
+		"Do not combine it with any other command.",
+		"<important>After this command, you cannot continue working on this task.</important>",
+		"On the lines after the marker, include a summary of what you did, what you found, and any open questions.",
+		// Important Rules, verbatim.
+		"Every response must contain exactly one action",
+		"The action must be enclosed in triple backticks",
+		"Directory or environment variable changes are not persistent. Every action is executed in a new subshell.",
+		// System information block.
 		"OS: " + sys.GOOS,
 		"Architecture: " + sys.GOARCH,
 		"<system_information>",
+		// Read-only investigation examples.
+		"git --no-pager",
 	} {
 		if !strings.Contains(task, want) {
 			t.Errorf("task prompt missing %q", want)
 		}
 	}
-	if sys.IsDarwin && !strings.Contains(task, "sed -i ''") {
-		t.Error("macOS sed note missing on darwin")
+
+	// No coding-specific copy: no issue framing, no file-editing recipes,
+	// no codebase/fix workflow verbs.
+	for _, banned := range []string{
+		"Please solve this issue", "issue", "codebase", "edit files",
+		"sed -i", "<<'EOF'", "nl -ba",
+	} {
+		if strings.Contains(task, banned) {
+			t.Errorf("task prompt contains coding-specific copy %q", banned)
+		}
+	}
+
+	if sys.IsDarwin && !strings.Contains(task, "You are on MacOS") {
+		t.Error("macOS note missing on darwin")
+	}
+	if !sys.IsDarwin && strings.Contains(task, "You are on MacOS") {
+		t.Error("macOS note leaked on non-darwin")
+	}
+}
+
+// TestDefaultTemplatesRenderAllFields renders the system and task
+// templates for every taskData field across platforms (linux/darwin,
+// amd64/arm64) under missingkey=error, so a typo'd field name or a
+// platform-conditional regression fails here instead of at construction
+// time on some other host.
+func TestDefaultTemplatesRenderAllFields(t *testing.T) {
+	platforms := []systemData{
+		{GOOS: "linux", GOARCH: "amd64", Hostname: "box-1", IsDarwin: false},
+		{GOOS: "darwin", GOARCH: "arm64", Hostname: "mac-1", IsDarwin: true},
+	}
+	for _, sys := range platforms {
+		if _, err := renderSystem(defaultSystemTemplate, sys); err != nil {
+			t.Errorf("system %s/%s: %v", sys.GOOS, sys.GOARCH, err)
+		}
+		task, err := renderTask(defaultTaskTemplate, taskData{
+			Task: "t", SubmitMarker: defaultSubmitMarker,
+			GOOS: sys.GOOS, GOARCH: sys.GOARCH, Hostname: sys.Hostname, IsDarwin: sys.IsDarwin,
+		})
+		if err != nil {
+			t.Errorf("task %s/%s: %v", sys.GOOS, sys.GOARCH, err)
+			continue
+		}
+		if !strings.Contains(task, "OS: "+sys.GOOS) || !strings.Contains(task, "Hostname: "+sys.Hostname) {
+			t.Errorf("task %s/%s: system information not rendered", sys.GOOS, sys.GOARCH)
+		}
+		if sys.IsDarwin != strings.Contains(task, "You are on MacOS") {
+			t.Errorf("task %s/%s: macOS note rendered = %t, want %t",
+				sys.GOOS, sys.GOARCH, !sys.IsDarwin, sys.IsDarwin)
+		}
 	}
 }

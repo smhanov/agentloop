@@ -31,9 +31,11 @@ assembled entirely from the public core:
 
 - a **search agent** that uses [serper](https://serper.dev) web search
   to answer multi-step queries, with inline citations
-- a **coding agent**, based on
-  [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent), that
-  solves tasks by executing shell commands in a workspace
+- a **shell agent**, a general-purpose command-executing agent whose wire
+  protocol and limits descend from
+  [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent); the
+  default templates are domain-neutral, and specialized missions (such as
+  coding) are one template override away
 
 **Going deeper.** If you want the full picture of how agents work —
 the tool-calling loop, budgets, streaming, skills, and how to build
@@ -145,7 +147,7 @@ go run ./examples/ask \
 ```
 
 ```bash
-# Bash coding agent: solves a task by executing commands in a workspace
+# Bash agent: completes a task by executing commands in a workspace
 go run ./examples/ask -provider zai -model glm-5.3-flash \
   -base-url https://api.z.ai/api/coding/paas/v4 \
   -agent bash -cwd /tmp/workspace -step-limit 20 -token-limit 2000000 \
@@ -246,7 +248,7 @@ call the two numberings are identical.
 - [Conversations](#conversations) — multi-turn sessions and prompt caching
 - [Skills](#skills) — folder layout, progressive disclosure, authoring
 - [The search agent](#the-search-agent) — complete usage guide
-- [The bash agent](#the-bash-agent) — mini-swe-agent-compatible coding agent
+- [The bash agent](#the-bash-agent) — general-purpose shell agent
 - [Writing your own agent](#writing-your-own-agent) — recipes
 - [Testing your agent](#testing-your-agent) — scripted fake providers
 - [Troubleshooting](#troubleshooting)
@@ -713,14 +715,17 @@ type Fetcher interface {
 
 ## The bash agent
 
-`github.com/smhanov/agentloop/bash` is a coding agent that solves tasks
-by executing shell commands in a workspace until it reports completion —
-a reimplementation of
-[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)'s behavior
-on the unmodified agentloop core: same templates, same limits, same exit
-statuses, same submission mechanism. Built with
-[`WithSkills`](#skills), loaded scripts run through its `bash` tool (L3):
-the `skill_read` result discloses the skill's base directory and
+`github.com/smhanov/agentloop/bash` is a general-purpose shell agent that
+completes tasks by executing shell commands in a workspace until it
+reports completion. Its wire protocol, limits, exit statuses, and
+submission mechanism descend from
+[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent), rebuilt on
+the unmodified agentloop core; the default templates are domain-neutral,
+so the preset frames any task — gather information, verify it, report —
+and specialized missions (coding included) are one template override away
+(see [Specializing the bash agent](#specializing-the-bash-agent)). Built
+with [`WithSkills`](#skills), loaded scripts run through its `bash` tool
+(L3): the `skill_read` result discloses the skill's base directory and
 `scripts/` entries, and only the script's output enters context.
 
 ```go
@@ -791,7 +796,10 @@ gate that blocks on human input implements *confirm* mode (the CLI's
 `-confirm` flag is exactly this). Blocking in the approval gate is
 sanctioned; `BeforeToolCall` may block for the same reason.
 
-**mini-swe-agent compatibility:**
+**mini-swe-agent wire compatibility.** The default templates no longer
+mirror mini's coding-task copy (they are domain-neutral; see the options
+table below), but the wire protocol, the limits, and the exit statuses
+keep their heritage:
 
 | mini-swe-agent | agentloop implementation |
 | --- | --- |
@@ -815,10 +823,43 @@ sanctioned; `BeforeToolCall` may block for the same reason.
 | `WithMaxConsecutiveFormatErrors(n)` | 3 | Malformed-response stop; 0 = unlimited. |
 | `WithSubmitMarker(s)` | mini's marker | The output line that ends a run as `Submitted`. |
 | `WithOutputLimit(n)` | 10000 | Observation truncation threshold in characters. |
-| `WithTemplates(system, task, observation)` | ported mini templates | Override templates (Go `text/template`); empty strings keep defaults. The system template renders once at construction; task and observation overrides also work per `Ask`. |
+| `WithTemplates(system, task, observation)` | general-purpose defaults | Override templates (Go `text/template`); empty strings keep defaults. The system template renders once at construction; task and observation overrides also work per `Ask`. |
 | `WithApprover(fn)` | nil (yolo) | Approval gate before every command. |
 | `WithToolProtocol()` | text protocol | Native tool-calling transport. |
 | `WithHooks(h)` | — | **Composes** with the protocol's internal hooks (protocol first, then yours). Prefer it over `agentloop.WithHooks`, which replaces the whole hook set and would silently disable the protocol. |
+
+**Specializing the bash agent.** The defaults are domain-neutral on
+purpose: the system template carries only the wire contract (exactly one
+fenced bash block with one command, a `THOUGHT` section), and the task
+template frames any mission — gather information, verify findings,
+record evidence, submit a report. To build a coding agent (or any other
+specialty), override the templates with
+`bash.WithTemplates(system, task, observation)`; empty strings keep the
+defaults. Whatever mission you write, keep the parts the run machinery
+depends on: the task template must render `{{.SubmitMarker}}` as an
+`echo` command the model can issue alone to finish the run, and a system
+override must keep the exactly-one-block contract and the `THOUGHT`
+section, or the text protocol cannot parse the responses. Templates may
+use only the fields `Task`, `SubmitMarker`, `GOOS`, `GOARCH`, `Hostname`,
+and `IsDarwin`.
+
+```go
+const sweTask = "Please solve this issue: {{.Task}}\n\n" +
+	"You can execute bash commands and edit files to implement the necessary changes.\n" +
+	"Work step by step: analyze the codebase, reproduce the problem, fix it,\n" +
+	"and verify with the project's tests before submitting.\n\n" +
+	"Finish by issuing this command alone: `echo {{.SubmitMarker}}`.\n" +
+	"On the lines after it, summarize the change.\n"
+
+agent, _ := bash.New(llm,
+	bash.WithTemplates("", sweTask, ""), // system and observation keep the defaults
+)
+```
+
+To change only the persona while keeping both templates, pass
+`agentloop.WithSystemPrompt("…")` to `bash.New` (or per `Ask`): it
+replaces the rendered system template — keep the one-block rules in your
+persona text — and the skills catalog, if any, is still appended.
 
 **Choosing a budget.** `WithTokenLimit` is the budget that works on
 flat-rate and subscription endpoints, where providers bill tokens but
@@ -1179,10 +1220,11 @@ they land in `main` individually.
   by configuration. Use laconic when you want a research pipeline; use
   agentloop when you want to build your own agent.
 - **[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)** is a
-  specific, minimal coding agent design. agentloop's bash preset
-  reproduces its protocol, templates, limits, and exit statuses on the
-  unmodified core — use it as-is, or as the reference for building your
-  own protocol on the same loop.
+  specific, minimal coding agent design. agentloop's bash preset descends
+  from it — same wire protocol, limits, and exit statuses on the
+  unmodified core — with domain-neutral default templates. Use it as-is,
+  specialize it with your own templates, or use it as the reference for
+  building your own protocol on the same loop.
 
 ## License
 

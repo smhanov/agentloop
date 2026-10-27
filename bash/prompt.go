@@ -14,9 +14,13 @@ import (
 const fence = "```"
 
 // defaultSystemTemplate is the system prompt: exactly one bash code block
-// per response with a THOUGHT section, ported from mini-swe-agent's
-// config/default.yaml (system_template).
-const defaultSystemTemplate = `You are a helpful assistant that can interact with a computer.
+// per response with a THOUGHT section. The wire contract (ONE block, ONE
+// command, THOUGHT, format example, rejection rule) is ported verbatim
+// from mini-swe-agent's config/default.yaml (system_template); only the
+// role sentence is generalized to a domain-neutral assistant. The
+// mswea_bash_command fence name stays: it is a wire identifier, not
+// mission text — renaming it would churn parsers for no generality gain.
+const defaultSystemTemplate = `You are a general-purpose assistant that can interact with a computer.
 
 Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).
 Include a THOUGHT section before your command where you explain your reasoning process.
@@ -34,24 +38,32 @@ Failure to follow these rules will cause your response to be rejected.
 `
 
 // defaultTaskTemplate is the first user message: the task plus the
-// recommended workflow, the persistence rules, system information, an
-// example response, and useful command examples — ported from mini's
-// instance_template. The macOS sed note is conditional on the platform.
-const defaultTaskTemplate = `Please solve this issue: {{.Task}}
+// recommended workflow, the operational cautions, the persistence rules,
+// system information, an example response, and useful command examples.
+// The structure descends from mini's instance_template, but the copy is
+// the general-purpose mission (T018): neutral framing, a
+// restate→gather→verify→record→submit workflow with an explicit
+// verification step, read-only investigation examples instead of file
+// editing recipes, and the report-after-marker line whose output lands in
+// Answer.Submission. Patterns per docs/harness-research.md §5 (gptme
+// ending discipline, OpenHands cautions and structured finish report,
+// terminal-bench per-step analysis); the macOS note is conditional on the
+// platform.
+const defaultTaskTemplate = `Complete this task: {{.Task}}
 
-You can execute bash commands and edit files to implement the necessary changes.
+You can execute bash commands to gather information, run tools, and inspect or modify the environment. You run unattended: every response must end with the next command or the submit marker. Never end with an offer to elaborate or a request for confirmation; there is no one to answer.
 
 ## Recommended Workflow
 
-This workflow should be done step-by-step so that you can iterate on your changes and any possible problems.
+Work step by step so that each command's output informs the next decision, and scale the effort to the task.
 
-1. Analyze the codebase by finding and reading relevant files
-2. Create a script to reproduce the issue
-3. Edit the source code to resolve the issue
-4. Verify your fix works by running your script again
-5. Test edge cases to ensure your fix is robust
-6. Submit your changes and finish your work by issuing the following command: ` + "`echo {{.SubmitMarker}}`" + `.
+1. Restate the objective in a sentence or two, and decide what to establish first.
+2. Gather information one command at a time, reading each result before choosing the next command.
+3. Verify before you report: cross-check every important claim against a second, independent command or source.
+4. Record what you learn in a notes file as you go, so the final report rests on written evidence.
+5. Submit your changes and finish your work by issuing the following command: ` + "`echo {{.SubmitMarker}}`" + `.
    Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+   On the lines after the marker, include a summary of what you did, what you found, and any open questions.
 
 ## Important Rules
 
@@ -60,16 +72,25 @@ This workflow should be done step-by-step so that you can iterate on your change
 3. Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
    However, you can prefix any action with ` + "`MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...`" + ` or write/load environment variables from files
 
+## Operational cautions
+
+- If the task asks a question, answer it. Do not modify the environment to change the answer.
+- Avoid commands that wait for interactive input: prefer ` + "`--no-pager`" + ` and batch flags over pagers and prompts, and poll long-running work with short checks instead of blocking.
+- Kill processes by their exact PID. A broad name or pattern can match unrelated work, including your own session.
+- Keep each command's output under the truncation limit: pipe through ` + "`| head`" + ` or ` + "`| tail`" + `, use targeted flags, or redirect to a file and view it in slices.
+
 <system_information>
 OS: {{.GOOS}}; Architecture: {{.GOARCH}}; Hostname: {{.Hostname}}
 </system_information>
-
+{{if .IsDarwin}}
+You are on MacOS. Some commands behave differently than on Linux (BSD userland); when output surprises you, check the command's documentation.
+{{end}}
 ## Formatting your response
 
 Here is an example of a correct response:
 
 <example_response>
-THOUGHT: I need to understand the structure of the repository first. Let me check what files are in the current directory to get a better understanding of the codebase.
+THOUGHT: I need to see what is in the current directory and which tools are available before planning the first real step.
 
 ` + fence + `mswea_bash_command
 ls -la
@@ -78,40 +99,30 @@ ls -la
 
 ## Useful command examples
 
-### Create a new file:
+### Explore files and text
 
 ` + fence + `mswea_bash_command
-cat <<'EOF' > newfile.txt
-hello = "world"
-print(hello)
-EOF
+# Find files by name, first 20 matches only
+find . -name '*.conf' -type f | head -20
+
+# Search inside files, with line numbers, bounded
+grep -rn "ERROR" logs/ | head -40
+
+# Show the start or the end of a file
+head -50 filename.txt
+tail -50 filename.txt
 ` + fence + `
 
-### Edit files with sed:
-{{if .IsDarwin}}
-<important>
-You are on MacOS. For all the below examples, you need to use ` + "`sed -i ''`" + ` instead of ` + "`sed -i`" + `.
-</important>
-{{end}}
-` + fence + `mswea_bash_command
-# Replace all occurrences
-sed -i 's/old_string/new_string/g' filename.txt
-
-# Replace only first occurrence
-sed -i 's/old_string/new_string/' filename.txt
-
-# Replace first occurrence on line 1
-sed -i '1s/old_string/new_string/' filename.txt
-
-# Replace all occurrences in lines 1-10
-sed -i '1,10s/old_string/new_string/g' filename.txt
-` + fence + `
-
-### View file content:
+### Inspect the system without paging
 
 ` + fence + `mswea_bash_command
-# View specific lines with numbers
-nl -ba filename.txt | sed -n '10,20p'
+# History and pending modifications, without an interactive pager
+git --no-pager log --oneline -10
+git --no-pager diff --stat
+
+# What is running, and which tools are installed
+ps aux | head -20
+command -v python3 && python3 --version
 ` + fence + `
 
 ### Any other command you want to run

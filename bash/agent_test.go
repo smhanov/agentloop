@@ -83,6 +83,37 @@ func TestE2ESubmittedTrajectory(t *testing.T) {
 	}
 }
 
+// TestSubmissionCarriesMarkerReport: the report the task template asks
+// for on the lines after the submit marker (what you did, what you found,
+// open questions) lands verbatim in Answer.Submission.
+func TestSubmissionCarriesMarkerReport(t *testing.T) {
+	resetScript(t,
+		cmdTurn("THOUGHT: look at the directory first", "ls"),
+		textTurn("THOUGHT: findings verified, submitting\n"+
+			fence+"mswea_bash_command\n"+
+			"echo '"+defaultSubmitMarker+"'\n"+
+			"echo 'What I did: listed the directory and counted the entries.'\n"+
+			"echo 'What I found: three files, all readable.'\n"+
+			"echo 'Open questions: none.'\n"+
+			fence),
+	)
+	agent := newFakeAgent(t, WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)))
+
+	ans, err := agent.Ask(context.Background(), "Report the directory contents.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.ExitStatus != ExitSubmitted {
+		t.Errorf("ExitStatus = %q, want %q", ans.ExitStatus, ExitSubmitted)
+	}
+	want := "What I did: listed the directory and counted the entries.\n" +
+		"What I found: three files, all readable.\n" +
+		"Open questions: none.\n"
+	if ans.Submission != want {
+		t.Errorf("Submission = %q, want %q", ans.Submission, want)
+	}
+}
+
 // TestFormatErrorThenRecovery: a response with zero blocks appends the
 // format-error guidance (general variant, found-0 count) and the run
 // continues to a clean submit.
