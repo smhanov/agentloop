@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -359,8 +360,15 @@ func TestAskDupCallWarningThenStop(t *testing.T) {
 		callTurn(same("c4")),
 		textTurn("unreachable"),
 	)
+	runs := 0
+	echo := echoTool()
+	handler := echo.Run
+	echo.Run = func(ctx context.Context, args json.RawMessage) (string, error) {
+		runs++
+		return handler(ctx, args)
+	}
 	var doneStatus AnswerStatus
-	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+	ag := newFakeAgent(t, WithTools(echo), WithHooks(Hooks{
 		OnDone: func(ctx context.Context, ev *Event) error {
 			doneStatus = ev.Answer.Status
 			return nil
@@ -377,19 +385,37 @@ func TestAskDupCallWarningThenStop(t *testing.T) {
 	if ans.ToolCalls != 3 || ans.Steps != 4 {
 		t.Errorf("got ToolCalls=%d Steps=%d, want 3/4", ans.ToolCalls, ans.Steps)
 	}
+	// The stopping call is vetoed before execution: the handler ran only
+	// for the three calls that were counted against the budget.
+	if runs != 3 {
+		t.Errorf("handler ran %d times, want 3 (stop must be pre-execution)", runs)
+	}
 
 	// Transcript: user, then (assistant, tool) three times with the warning
-	// on the third result, then the fourth assistant call and its stop note.
-	if got := textOf(ans.Messages[6]); got != warningObservation {
-		t.Errorf("third observation = %q, want warning", got)
-	}
-	if got := textOf(ans.Messages[8]); got != stopObservation {
-		t.Errorf("fourth observation = %q, want stop", got)
-	}
+	// appended to the third result, then the fourth assistant call and its
+	// stop note.
 	for _, idx := range []int{2, 4} {
 		if got := textOf(ans.Messages[idx]); got != `echo:{"n":1}` {
 			t.Errorf("result %d = %q", idx, got)
 		}
+	}
+	third := textOf(ans.Messages[6])
+	if !strings.HasPrefix(third, `echo:{"n":1}`) {
+		t.Errorf("third observation = %q, want the real output plus a warning", third)
+	}
+	for _, want := range []string{
+		`"warning":"repeated identical call; change approach"`,
+		`"repeated":"echo:{\"n\":1}"`,
+	} {
+		if !strings.Contains(third, want) {
+			t.Errorf("third observation %q missing %s", third, want)
+		}
+	}
+	if got := textOf(ans.Messages[8]); got != stopObservation {
+		t.Errorf("fourth observation = %q, want stop", got)
+	}
+	if len(ans.Tools) != 3 || ans.Tools[2].Output != third {
+		t.Errorf("trace = %+v, want three entries with the warned observation", ans.Tools)
 	}
 }
 
@@ -415,6 +441,163 @@ func TestAskDupCallCounterResets(t *testing.T) {
 		if strings.Contains(textOf(m), `"warning"`) {
 			t.Errorf("message %d carries a warning: %q", i, textOf(m))
 		}
+	}
+}
+
+// TestAskDupCallPollingOutputChanges: identical polling calls whose output
+// changes are progress, not a loop — every call runs, and no warning or
+// stop is delivered.
+func TestAskDupCallPollingOutputChanges(t *testing.T) {
+	polls := 0
+	poll := Tool{
+		Def: llmhub.NewTool("poll", "Poll a job's status", map[string]any{"type": "object"}),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			polls++
+			return fmt.Sprintf("state:%d", polls), nil
+		},
+	}
+	const calls = 6
+	turns := make([]fakeTurn, 0, calls+1)
+	for i := 0; i < calls; i++ {
+		turns = append(turns, callTurn(llmhub.ToolCall(fmt.Sprintf("c%d", i), "poll", `{"job":"j1"}`)))
+	}
+	turns = append(turns, textTurn("finished"))
+	resetScript(t, turns...)
+	ag := newFakeAgent(t, WithTools(poll), WithMaxToolCalls(calls+1))
+
+	ans, err := ag.Ask(context.Background(), "Poll until the job finishes.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusCompleted || ans.ToolCalls != calls || ans.Steps != calls+1 {
+		t.Fatalf("got Status=%v ToolCalls=%d Steps=%d, want completed %d/%d",
+			ans.Status, ans.ToolCalls, ans.Steps, calls, calls+1)
+	}
+	if polls != calls {
+		t.Errorf("handler ran %d times, want %d", polls, calls)
+	}
+	// Every observation is the tool's real, changing output.
+	for i := 0; i < calls; i++ {
+		if got, want := textOf(ans.Messages[2+2*i]), fmt.Sprintf("state:%d", i+1); got != want {
+			t.Errorf("result %d = %q, want %q", i, got, want)
+		}
+	}
+	for i, m := range ans.Messages {
+		if strings.Contains(textOf(m), "repeated identical call") {
+			t.Errorf("message %d carries a duplicate warning: %q", i, textOf(m))
+		}
+	}
+}
+
+// TestAskDupCallOutputChangeResets: the same call with a changed output
+// restarts the streak, so three identical calls never accumulate across a
+// changed observation.
+func TestAskDupCallOutputChangeResets(t *testing.T) {
+	n := 0
+	volatile := Tool{
+		Def: llmhub.NewTool("volatile", "Output changes every third call", map[string]any{"type": "object"}),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			n++
+			if n == 3 {
+				return "state:changed", nil
+			}
+			return "state:same", nil
+		},
+	}
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "volatile", `{}`)),
+		callTurn(llmhub.ToolCall("c2", "volatile", `{}`)),
+		callTurn(llmhub.ToolCall("c3", "volatile", `{}`)),
+		callTurn(llmhub.ToolCall("c4", "volatile", `{}`)),
+		textTurn("ok"),
+	)
+	ag := newFakeAgent(t, WithTools(volatile))
+
+	ans, err := ag.Ask(context.Background(), "Watch the output.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusCompleted || ans.ToolCalls != 4 || ans.Steps != 5 {
+		t.Fatalf("got Status=%v ToolCalls=%d Steps=%d", ans.Status, ans.ToolCalls, ans.Steps)
+	}
+	for i, m := range ans.Messages {
+		if strings.Contains(textOf(m), `"warning"`) {
+			t.Errorf("message %d carries a warning: %q", i, textOf(m))
+		}
+	}
+}
+
+// TestAskDupCallRepetitiveToolExempt: Repetitive opts a polling-style tool
+// out of loop detection entirely, even when its output never changes.
+func TestAskDupCallRepetitiveToolExempt(t *testing.T) {
+	const calls = 6
+	status := Tool{
+		Def: llmhub.NewTool("status", "Fixed status response", map[string]any{"type": "object"}),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return "state:pending", nil
+		},
+		Repetitive: true,
+	}
+	turns := make([]fakeTurn, 0, calls+1)
+	for i := 0; i < calls; i++ {
+		turns = append(turns, callTurn(llmhub.ToolCall(fmt.Sprintf("c%d", i), "status", `{}`)))
+	}
+	turns = append(turns, textTurn("done"))
+	resetScript(t, turns...)
+	ag := newFakeAgent(t, WithTools(status), WithMaxToolCalls(calls+1))
+
+	ans, err := ag.Ask(context.Background(), "Check the status.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusCompleted || ans.ToolCalls != calls || ans.Steps != calls+1 {
+		t.Fatalf("got Status=%v ToolCalls=%d Steps=%d, want completed %d/%d",
+			ans.Status, ans.ToolCalls, ans.Steps, calls, calls+1)
+	}
+	for i, m := range ans.Messages {
+		if strings.Contains(textOf(m), "repeated identical call") {
+			t.Errorf("message %d carries a duplicate warning: %q", i, textOf(m))
+		}
+	}
+}
+
+// TestAskDupCallParallelWarnsInCallOrder: three identical calls in one
+// response are accounted in call order, so the third observation carries
+// the warning; the next identical call (in the following step) is stopped
+// pre-execution.
+func TestAskDupCallParallelWarnsInCallOrder(t *testing.T) {
+	same := func(id string) *llmhub.ToolCallContent {
+		return llmhub.ToolCall(id, "echo", `{"n":1}`)
+	}
+	resetScript(t,
+		callTurn(same("p1"), same("p2"), same("p3")),
+		callTurn(same("p4")),
+		textTurn("unreachable"),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()))
+
+	ans, err := ag.Ask(context.Background(), "Fan out identical calls.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusStopped || ans.ToolCalls != 3 || ans.Steps != 2 {
+		t.Fatalf("got Status=%v ToolCalls=%d Steps=%d, want stopped 3/2", ans.Status, ans.ToolCalls, ans.Steps)
+	}
+	for _, idx := range []int{2, 3} {
+		if got := textOf(ans.Messages[idx]); got != `echo:{"n":1}` {
+			t.Errorf("result at message %d = %q", idx, got)
+		}
+	}
+	warned := textOf(ans.Messages[4])
+	if !strings.HasPrefix(warned, `echo:{"n":1}`) ||
+		!strings.Contains(warned, "repeated identical call; change approach") {
+		t.Errorf("third parallel result = %q, want real output plus warning", warned)
+	}
+	if got := textOf(ans.Messages[6]); got != stopObservation {
+		t.Errorf("stop observation = %q, want %q", got, stopObservation)
+	}
+	if len(ans.Tools) != 3 || ans.Tools[2].Output != warned {
+		t.Errorf("trace = %+v, want three entries with the warned observation", ans.Tools)
 	}
 }
 

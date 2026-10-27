@@ -44,6 +44,8 @@ type run struct {
 	trace      []ToolResult
 	dupKey     string // (name, args) key of the current consecutive run
 	dupCount   int    // length of the current consecutive identical-call run
+	dupOutput  string // observation of the latest call in that run
+	dupNudged  bool   // the run has warned; the next identical call stops
 	notice     bool   // the forced-final notice is already in the transcript
 }
 

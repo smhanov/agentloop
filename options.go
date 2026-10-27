@@ -9,8 +9,8 @@ import (
 const (
 	// defaultMaxToolCalls is the per-Ask tool-execution budget.
 	defaultMaxToolCalls = 5
-	// defaultDupCallLimit is how many consecutive identical tool calls are
-	// tolerated before the loop intervenes.
+	// defaultDupCallLimit is how many consecutive identical tool calls
+	// with identical output are tolerated before the loop intervenes.
 	defaultDupCallLimit = 3
 	// defaultParallelTools bounds concurrent parallel-eligible executions.
 	defaultParallelTools = 3
@@ -109,10 +109,13 @@ func WithMaxSteps(n int) Option {
 	}
 }
 
-// WithDupCallLimit sets how many consecutive identical tool calls (same
-// name and arguments) are tolerated; that many repeats deliver a warning
-// observation, and one more stops the run gracefully with StatusStopped.
-// 0 disables detection entirely; the default is 3.
+// WithDupCallLimit sets how many consecutive identical tool calls with
+// identical output (same name and arguments, unchanged result) are
+// tolerated; that many repeats deliver the tool's real output with a
+// warning appended, and one more identical call stops the run gracefully
+// with StatusStopped before it executes. A differing call or a changed
+// output resets the counter. 0 disables detection entirely; the default is
+// 3.
 func WithDupCallLimit(n int) Option {
 	return func(c *config) {
 		if n >= 0 {

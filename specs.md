@@ -183,7 +183,7 @@ WithTools(t ...Tool) Option            // register tools (replaces set); keep th
 WithMaxToolCalls(n int) Option         // tool executions allowed per Ask; default 5, min 1 (search preset: 8)
 WithMaxSteps(n int) Option             // hard ceiling on model inferences per Ask; default 2*MaxToolCalls+2
 WithParallelTools(n int) Option        // max concurrent parallel-eligible (Sequential == false) executions per step; default 3; 1 = sequential
-WithDupCallLimit(n int) Option         // consecutive identical tool calls before graceful stop; default 3; 0 disables
+WithDupCallLimit(n int) Option         // consecutive identical calls with identical output before graceful stop; default 3; 0 disables
 WithStreamWatchdog(d time.Duration) Option // abort AskStream when no chunk arrives for d; default 90s; 0 disables
 WithHooks(h Hooks) Option              // hook callbacks (see §5.3)
 WithSkills(dirs ...string) Option      // enable skills: catalog in prompt + skill_read tool (see §5.8)
@@ -217,6 +217,11 @@ type Tool struct {
     // Sequential to true for stateful tools (shell sessions,
     // transactions).
     Sequential bool
+
+    // Repetitive exempts the tool from duplicate-call loop detection. Set
+    // it for polling/status tools: identical calls are expected, and a
+    // changing observation is the progress signal. Budgets still apply.
+    Repetitive bool
 }
 ```
 ```
@@ -240,11 +245,17 @@ type Tool struct {
   overlapping with anything, `AfterToolCall` fires as each execution
   completes, and tool result messages are appended in **original call
   order** regardless of completion order.
-- **Loop detection** (ZeroClaw): `WithDupCallLimit(n)` (default 3, 0
-  disables) — N consecutive *identical* tool calls (same name and
-  arguments) trigger a `{"warning": "repeated identical call; change
-  approach"}` observation; the next repeat stops the run gracefully with
-  `Status = StatusStopped`. Required for unattended operation.
+- **Loop detection** (ZeroClaw, output-aware): `WithDupCallLimit(n)`
+  (default 3, 0 disables) — N consecutive identical tool calls (same name
+  and arguments) **with identical output** trigger the tool's real output
+  with a `{"warning": "repeated identical call; change approach",
+  "repeated": "<excerpt>"}` object appended (the output is never
+  replaced); the next identical call stops the run gracefully with
+  `Status = StatusStopped` before it executes. A differing call or a
+  changed output resets the streak, so legitimate polling is not a loop.
+  `Tool.Repetitive` opts a polling/status tool out entirely. Required for
+  unattended operation; the stop is pre-execution, so calls and steps
+  never exceed their ceilings.
 
 ### 5.3 Hooks
 
@@ -1132,7 +1143,7 @@ Verified against the live API (same host and key as `/search`):
 | environment failure (timeout, spawn error) | observation via `ExceptionInfo` — not an error |
 | llmhub Generate error | propagate immediately, wrapped |
 | budget/step ceiling | `ErrBudgetExhausted` / `EventError`; `Answer.Status = StatusBudgetExhausted` |
-| repeated identical tool calls (dup limit) | warning observation, then graceful stop with `Status = StatusStopped` |
+| repeated identical tool calls with identical output (dup limit) | real output with warning appended, then graceful stop with `Status = StatusStopped` on the next identical call |
 | stale stream (no chunk for `WithStreamWatchdog`) | run aborted with `ErrStreamStale` (Hermes 90s watchdog pattern) |
 | ctx canceled | `ctx.Err()` unwrapped |
 
@@ -1172,8 +1183,11 @@ All offline tests run without network (`go test ./...`).
    while `AfterToolCall` fires in completion order, `Sequential=true`
    tools execute strictly in order amid parallel-eligible ones, and
    `WithParallelTools(1)` executes sequentially; **loop detection** —
-   dup-call warning at the limit, graceful `StatusStopped` on the next
-   repeat, counter resets on any differing call; **stream watchdog** —
+   dup-call warning appended to the real output at the limit, graceful
+   `StatusStopped` on the next identical call with identical output,
+   counter resets on any differing call or changed output,
+   `Repetitive: true` exempts a polling tool, and parallel calls are
+   accounted in call order; **stream watchdog** —
    stalled fake stream aborts with `ErrStreamStale`, nil when disabled;
    **completion status** — StatusCompleted/BudgetExhausted/Stopped across
    the graceful-stop paths; **conversations** —
@@ -1225,8 +1239,9 @@ All offline tests run without network (`go test ./...`).
    same scenario; approver veto produces an observation and the run
    continues. **P0 blocking tier** (fail the build first, run before all
    else — GoClaw NLB pattern): the loop can never exceed `MaxSteps` or
-   `MaxToolCalls` even with a malicious/malformed provider script, dup-call
-   detection always terminates repeated-identical-call loops, and no tool
+   `MaxToolCalls` even with a malicious/malformed provider script,
+   identical-call-and-identical-output loops always terminate (warn at
+   the limit, stop pre-execution on the next repeat), and no tool
    result exceeds its byte cap.
 8. **JSON helpers:** fenced/prefixed/nested JSON extraction cases.
 9. **Skills:** validation table (bad frontmatter, name/dirname mismatch,
@@ -1554,11 +1569,11 @@ to this spec's choices:
 | §2 loop shape 3: reusable loop fn + parallel per-iteration execution (PicoClaw `ToolLoop`) | the core loop (§5.4) — one implementation shared by presets and conversations |
 | §2 multiple limit dimensions (steps + cost + wall-time) | `MaxToolCalls` + `MaxSteps` + dup-call limit + ctx deadline; bash preset adds graceful cost/wall-time (§8.1) |
 | §2 termination: completion-reason enum (dsh) | `Answer.Status` (§5.6); `bash.Answer.ExitStatus` keeps mini's strings |
-| §2 loop detection (repeated identical calls) | `WithDupCallLimit` (§5.2) |
+| §2 loop detection (identical calls and output) | `WithDupCallLimit` + `Tool.Repetitive` (§5.2) |
 | §2 steering/inbox seam (steer/inject/cancel) | `BeforeGenerate` message-append + ctx cancel (§5.5) |
 | §2 loop shape 5: event-log projection (dsh `deriveMessages`) | append-only transcript + `RebuildContext` projection hook (§5.3) — the LLM context is derived, never mutated |
 | §4 overflow → compress + retry; compression is the sanctioned prefix mutation | `RebuildContext` hook: deterministic compression of older steps, trailing tool-call/result pair preserved (§5.3) |
-| §3 ToolDefinition/ToolSchema split; `isConcurrencySafe` batching | `Tool{Def, Run, Sequential}` (§5.2) |
+| §3 ToolDefinition/ToolSchema split; `isConcurrencySafe` batching | `Tool{Def, Run, Sequential}` + `Repetitive` (§5.2) |
 | §3 guarded execution / approval gates | `WithApprover` on the bash preset; blocking `BeforeToolCall` sanctioned (§5.3, §8.1) |
 | §3 malformed-call repair in-band (Levenshtein names, error results) | §5.2 — tool errors and unknown-name suggestions are tool results, never hard fails |
 | §3 one-tool counter-case (mini) | bash preset ships exactly one `bash` tool (§8) |

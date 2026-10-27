@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/smhanov/llmhub"
 )
@@ -35,6 +36,12 @@ type Tool struct {
 	// Sequential to true for stateful tools (shell sessions,
 	// transactions).
 	Sequential bool
+
+	// Repetitive exempts the tool from duplicate-call loop detection. Set
+	// it for tools whose job is polling or status: identical calls are
+	// expected, and changing output is the progress signal. The tool still
+	// counts against MaxToolCalls and MaxSteps like any other.
+	Repetitive bool
 }
 
 // Observation payloads the loop itself delivers to the model.
@@ -42,9 +49,10 @@ const (
 	// skippedResult is the tool result message content for calls vetoed by
 	// a BeforeToolCall hook via ErrSkipToolCall.
 	skippedResult = "skipped"
-	// warningObservation replaces the output of the tool call that reaches
-	// the duplicate-call limit.
-	warningObservation = `{"warning": "repeated identical call; change approach"}`
+	// dupWarning is the stable sentence appended to a tool's real output
+	// when identical calls with identical output reach the duplicate-call
+	// limit.
+	dupWarning = "repeated identical call; change approach"
 	// stopObservation is delivered for one repeat too many; the run then
 	// stops gracefully with StatusStopped.
 	stopObservation = `{"warning": "repeated identical call; stopping"}`
@@ -52,6 +60,27 @@ const (
 	// MaxToolCalls budget was spent.
 	budgetObservation = `{"error": "tool call budget exhausted"}`
 )
+
+// dupWarningObservation appends the duplicate-call warning to the real
+// observation instead of replacing it, quoting a short excerpt of the
+// repeated output as evidence. The excerpt is capped at roughly 200 bytes
+// on a UTF-8 boundary so a huge result cannot bloat the warning.
+func dupWarningObservation(observation string) string {
+	const maxExcerpt = 200
+	excerpt := observation
+	if len(excerpt) > maxExcerpt {
+		cut := maxExcerpt
+		for cut > 0 && !utf8.RuneStart(excerpt[cut]) {
+			cut--
+		}
+		excerpt = excerpt[:cut]
+	}
+	b, _ := json.Marshal(struct {
+		Warning  string `json:"warning"`
+		Repeated string `json:"repeated"`
+	}{dupWarning, excerpt})
+	return observation + string(b)
+}
 
 // errorJSON renders a failure as the in-band error observation the model
 // sees; the loop itself continues.
@@ -145,7 +174,6 @@ type callPlan struct {
 	call   *llmhub.ToolCallContent
 	args   json.RawMessage
 	tool   Tool
-	warn   bool        // deliver the duplicate-call warning instead of the output
 	result *stepResult // pre-filled for planResolved and planStop
 }
 
@@ -273,10 +301,21 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 	}
 
 	// Append results in original call order regardless of completion order.
+	// Execute-time duplicate accounting happens here too, so parallel calls
+	// are judged in call order and every observation is available.
 	for k, plan := range plans {
 		res := results[k]
 		if res == nil {
 			continue // aborted before execution; the run is failing anyway
+		}
+		if plan.mode == planExecuteSequential || plan.mode == planExecuteParallel {
+			observation := r.noteDupCall(plan, res.observation)
+			if observation != res.observation {
+				res.observation = observation
+				if res.trace != nil {
+					res.trace.Output = observation
+				}
+			}
 		}
 		r.appendToolResult(plan.call, res.observation)
 		if res.trace != nil {
@@ -284,6 +323,30 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 		}
 	}
 	return stopped, nil
+}
+
+// noteDupCall applies duplicate-call accounting to one executed call's
+// observation, in call order. A repeated call whose output changed is
+// progress, so the streak restarts and the new output becomes the
+// baseline; only an identical call with identical output extends it. At
+// the limit the warning is appended to the real output — never substituted
+// for it — and the run is armed to stop on the next identical call before
+// it executes. Tools marked Repetitive are exempt.
+func (r *run) noteDupCall(plan callPlan, observation string) string {
+	if r.cfg.dupCallLimit <= 0 || plan.tool.Repetitive {
+		return observation
+	}
+	key := plan.call.Name + "\x00" + string(plan.args)
+	if key != r.dupKey || observation != r.dupOutput {
+		r.dupKey, r.dupCount, r.dupOutput, r.dupNudged = key, 1, observation, false
+		return observation
+	}
+	r.dupCount++
+	if r.dupCount < r.cfg.dupCallLimit {
+		return observation
+	}
+	r.dupNudged = true
+	return dupWarningObservation(observation)
 }
 
 // planCall resolves one model-requested tool call: it fires BeforeToolCall
@@ -305,23 +368,18 @@ func (r *run) planCall(ctx context.Context, step int, call *llmhub.ToolCallConte
 	}
 	r.emit(&Event{Kind: EventBeforeToolCall, Step: step, Call: call, Args: plan.args})
 
-	// Loop detection: identical consecutive (name, args) calls warn at the
-	// limit and stop the run on the next repeat. Any differing call resets
-	// the run.
-	if r.cfg.dupCallLimit > 0 {
+	// Loop detection has two halves. This plan-time half vetoes a repeat
+	// that follows an already-warned identical call, before it executes;
+	// the streak itself is accounted after execution (noteDupCall), where
+	// the output is known. Tools marked Repetitive (polling/status) never
+	// participate.
+	tool, found := r.lookup(call.Name)
+	if r.cfg.dupCallLimit > 0 && !(found && tool.Repetitive) {
 		key := call.Name + "\x00" + string(plan.args)
-		if key == r.dupKey {
-			r.dupCount++
-		} else {
-			r.dupKey, r.dupCount = key, 1
-		}
-		switch {
-		case r.dupCount > r.cfg.dupCallLimit:
+		if key == r.dupKey && r.dupCount >= r.cfg.dupCallLimit && r.dupNudged {
 			plan.mode = planStop
 			plan.result = &stepResult{observation: stopObservation}
 			return plan, nil
-		case r.dupCount == r.cfg.dupCallLimit:
-			plan.warn = true
 		}
 	}
 
@@ -332,7 +390,6 @@ func (r *run) planCall(ctx context.Context, step int, call *llmhub.ToolCallConte
 		return plan, nil
 	}
 
-	tool, found := r.lookup(call.Name)
 	if !found {
 		observation := unknownToolJSON(suggestName(call.Name, r.registeredNames()))
 		r.executed++ // unknown names count against the budget
@@ -354,25 +411,22 @@ func (r *run) planCall(ctx context.Context, step int, call *llmhub.ToolCallConte
 }
 
 // executePlan runs one planned call's handler, renders the observation
-// (in-band error or duplicate warning as needed), records the trace entry,
-// and fires AfterToolCall in completion order. Returned errors abort the
-// run: handler context errors and AfterToolCall hook errors.
+// (in-band error as needed), records the trace entry, and fires
+// AfterToolCall in completion order. Returned errors abort the run: handler
+// context errors and AfterToolCall hook errors.
 func (r *run) executePlan(ctx context.Context, step int, plan callPlan) (*stepResult, error) {
 	start := time.Now()
 	output, handlerErr := plan.tool.Run(ctx, plan.args)
 	duration := time.Since(start)
 
 	observation := output
-	switch {
-	case handlerErr != nil:
+	if handlerErr != nil {
 		if errors.Is(handlerErr, context.Canceled) || errors.Is(handlerErr, context.DeadlineExceeded) {
 			// Context errors abort the run; every other handler error is
 			// repaired in-band.
 			return nil, handlerErr
 		}
 		observation = errorJSON(handlerErr)
-	case plan.warn:
-		observation = warningObservation
 	}
 
 	res := &stepResult{

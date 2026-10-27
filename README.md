@@ -283,7 +283,7 @@ per-call options apply after the constructor's, so the later one wins.
 | `WithTools(t ...Tool)` | none | Replaces the registered tool set. Keep it small: schemas are sent to the model on every inference. |
 | `WithMaxToolCalls(n)` | 5 (min 1) | Tool executions allowed per `Ask`. Once spent, the loop forces a final answer (see [Budgets](#budgets-and-loop-safety)). |
 | `WithMaxSteps(n)` | `2*MaxToolCalls+2` | Hard ceiling on model inferences per `Ask`; exceeding it fails with `ErrBudgetExhausted`. |
-| `WithDupCallLimit(n)` | 3 | Consecutive identical tool calls tolerated before loop detection intervenes; 0 disables. |
+| `WithDupCallLimit(n)` | 3 | Consecutive identical tool calls with identical output tolerated before loop detection intervenes; any differing call **or output** resets the streak. 0 disables. |
 | `WithParallelTools(n)` | 3 | Max concurrent parallel-eligible executions per step; 1 forces strictly sequential. |
 | `WithStreamWatchdog(d)` | 90s | Aborts `AskStream` when no chunk arrives for `d` (`ErrStreamStale`); 0 disables. |
 | `WithHooks(h)` | none | Hook callbacks — the extension surface ([Hooks](#hooks)). |
@@ -342,6 +342,11 @@ one response requests several calls, parallel-eligible tools execute
 concurrently while `Sequential` tools run strictly in call order; tool
 results are always appended in original call order, and `AfterToolCall`
 fires as each execution completes.
+
+Set `Repetitive: true` for polling or status tools. It exempts the tool
+from duplicate-call loop detection: identical calls are expected, and a
+changing observation is the progress signal. The tool still counts
+against `WithMaxToolCalls` and `WithMaxSteps` like any other.
 
 ## Hooks
 
@@ -433,11 +438,16 @@ Multiple limit dimensions always apply at once, so no run can run away:
   ceiling on model inferences; exceeding it returns `ErrBudgetExhausted`
   with `Answer.Status = StatusBudgetExhausted` (partial trace included).
   All graceful limits elsewhere funnel into this safety net.
-- **Loop detection** — `WithDupCallLimit` (default 3, 0 disables). That
-  many consecutive *identical* calls (same name and arguments) deliver a
-  `{"warning": "repeated identical call; change approach"}` observation;
-  one more repeat stops the run gracefully with `StatusStopped`. Any
-  differing call resets the counter.
+- **Loop detection** — `WithDupCallLimit` (default 3, 0 disables). A
+  repeat counts only when both the call (same name and arguments) **and**
+  its observation are identical; changing output is progress, so legitimate
+  polling does not trip it. That many repeats deliver the tool's real
+  output with a warning JSON object appended — `{"warning": "repeated
+  identical call; change approach", "repeated": "<excerpt>"}`; the real
+  output is never replaced. One more identical call stops the run
+  gracefully with `StatusStopped` before it executes. Any differing call
+  or differing output resets the counter. Polling-style tools can opt out
+  entirely with `Repetitive: true`.
 - **Your context** — `ctx` deadlines and cancellation are honored
   everywhere (LLM calls, tools, HTTP, command execution) and returned
   unwrapped. This is the hard wall-clock stop; for *graceful* wall-time
@@ -448,7 +458,7 @@ How runs end — `Answer.Status`:
 | Status | Meaning |
 | --- | --- |
 | `StatusCompleted` | the model produced a final answer (including the forced answer after the tool budget ran out) |
-| `StatusStopped` | graceful stop: a `BeforeGenerate` hook set `Skip`, or duplicate-call detection fired |
+| `StatusStopped` | graceful stop: a `BeforeGenerate` hook set `Skip`, or duplicate-call detection fired (identical calls with identical output) |
 | `StatusBudgetExhausted` | the `MaxSteps` ceiling was reached; `Ask` also returns an error wrapping `ErrBudgetExhausted` |
 
 ## Streaming
@@ -1017,16 +1027,21 @@ forcing, hook rewrites — the way agentloop's own tests do.
   was reached before a final answer. Raise `WithMaxToolCalls` /
   `WithMaxSteps`, check that your tool outputs give the model what it
   needs to finish (huge outputs waste steps — truncate in the handler),
-  and rely on `WithDupCallLimit` if the model repeats itself. The
-  CLI's exit code 2 means exactly this.
+  and rely on `WithDupCallLimit` if the model repeats the same call with
+  unchanged output. The CLI's exit code 2 means exactly this.
 - **`ErrStreamStale`.** No stream chunk arrived within the watchdog
   window — usually a hung provider connection. Retry, or tune
   `WithStreamWatchdog` (`0` disables, not recommended for unattended
   use).
 - **`StatusStopped` without an obvious cause.** Either a hook set
   `ev.Skip` (your cost cap or the bash limits fire this way) or
-  duplicate-call detection fired after repeated identical calls. The
-  trace in `Answer.Tools` shows which.
+  duplicate-call detection fired after the same call kept returning the
+  same output. In the latter case the last tool result carries the real
+  output with `"repeated identical call; change approach"` appended, and
+  the run stops on the next identical call with a
+  `"repeated identical call; stopping"` observation. The trace in
+  `Answer.Tools` shows which; for a deliberately polled tool, set
+  `Repetitive: true`.
 - **`RepeatedFormatError` (bash agent).** The model cannot reliably
   follow the text-action protocol. Try `bash.WithToolProtocol()` (or the
   CLI's `-tool-protocol`) for models with solid tool calling, or lower
