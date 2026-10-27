@@ -141,13 +141,16 @@ func TestToolProtocolTrajectoryMatchesText(t *testing.T) {
 	}
 }
 
-// TestProtocolLimitsAndApprover (§12.7): the step/cost/wall limits and the
+// TestProtocolLimitsAndApprover (§12.7): the step/token/wall limits and the
 // approval gate fire identically in both protocols — same exit statuses,
 // same step counts, same veto observation, and a vetoed command is never
-// executed. The first turn is billed in every script so the cost-limit case
-// can trip.
+// executed. The first turn is billed in every script so the token-limit
+// case can trip.
 func TestProtocolLimitsAndApprover(t *testing.T) {
-	billed := func(turn fakeTurn) fakeTurn { turn.usage = llmhub.UsageMetadata{Cost: 1.0}; return turn }
+	billed := func(turn fakeTurn) fakeTurn {
+		turn.usage = llmhub.UsageMetadata{TotalTokens: 120000}
+		return turn
+	}
 
 	cases := []struct {
 		name      string
@@ -156,7 +159,7 @@ func TestProtocolLimitsAndApprover(t *testing.T) {
 		wantSteps int
 	}{
 		{"step-limit", []Option{WithStepLimit(1)}, ExitLimitsExceeded, 1},
-		{"cost-limit", []Option{WithCostLimit(0.5)}, ExitLimitsExceeded, 1},
+		{"token-limit", []Option{WithTokenLimit(100000)}, ExitLimitsExceeded, 1},
 		// The 1ns wall-time limit trips before the first inference, so no
 		// step completes in either protocol.
 		{"wall-time", []Option{WithWallTimeLimit(time.Nanosecond)}, ExitTimeExceeded, 0},

@@ -933,7 +933,7 @@ Preset options (in addition to all core options):
 ```go
 WithEnvironment(env Environment) Option       // default LocalEnvironment("", 30s)
 WithStepLimit(n int) Option                   // max LLM steps; 0 = unlimited (default 0, like mini's default config)
-WithCostLimit(usd float64) Option             // graceful stop when cumulative Usage.Cost exceeds; 0 = unlimited
+WithTokenLimit(n int64) Option                // graceful stop when cumulative counted tokens reach n: Σ per-step TotalTokens (Prompt+Completion fallback when a provider reports no total); cache-read tokens count; 0 = unlimited
 WithWallTimeLimit(d time.Duration) Option     // graceful stop on wall-clock time; 0 = unlimited
 WithMaxConsecutiveFormatErrors(n int) Option  // text protocol; default 3, 0 = unlimited
 WithSubmitMarker(s string) Option             // default "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
@@ -1080,7 +1080,7 @@ included for compatibility (§17).
 | --- | --- |
 | `run(task)` message loop | core `Ask` loop; continuation via AfterGenerate finish-veto |
 | `query()` `step_limit` check | `WithStepLimit` enforced in BeforeGenerate hook → `ev.Skip` graceful stop, `ExitStatus="LimitsExceeded"` |
-| `cost_limit` (stop after exceeding) | same hook, cumulative `Usage.Cost` across steps |
+| `cost_limit` (stop after exceeding) | deliberate deviation: removed — flat-rate/subscription endpoints report `$0.00`; `WithTokenLimit` (cumulative counted tokens, same hook) is the budget that works there |
 | `wall_time_limit_seconds` | same hook, monotonic clock |
 | `max_consecutive_format_errors` (3) | text-protocol hook counter → `"RepeatedFormatError"` |
 | `TimeExceeded` exit | `"TimeExceeded"` |
@@ -1109,7 +1109,7 @@ agent, _ := bash.New(llm,
     bash.WithEnvironment(bash.NewLocalEnvironment(
         "/tmp/workspace", nil, 60*time.Second)),
     bash.WithStepLimit(20),
-    bash.WithCostLimit(1.5))
+    bash.WithTokenLimit(2000000))
 
 ans, err := agent.Ask(ctx, "Add a README.md describing this project.")
 // ans.ExitStatus == "Submitted"; ans.Submission holds the final output
@@ -1408,7 +1408,7 @@ go run ./examples/ask \
   -provider zai -model glm-5.3 \
   -base-url https://api.z.ai/api/coding/paas/v4 \
   -agent bash -cwd /tmp/workspace \
-  -step-limit 20 -cost-limit 1.5 \
+  -step-limit 20 -token-limit 2000000 \
   -prompt "Add a README.md describing this project." \
   -stream -v
 ```
@@ -1429,7 +1429,7 @@ go run ./examples/ask \
 | `-cwd` | working directory for the bash agent (default `.`) |
 | `-env` | extra env `KEY=VALUE` for the bash agent (repeatable) |
 | `-skills` | comma-separated skill directories to load (§5.8); works with every agent |
-| `-step-limit`, `-cost-limit` | bash agent limits |
+| `-step-limit`, `-token-limit` | bash agent limits |
 | `-confirm` | bash agent: prompt before each command (mini's confirm mode; default off = yolo) |
 | `-tool-protocol` | bash agent: native tool calling instead of text protocol |
 | `-stream` | stream live to stdout: answer deltas as they arrive; reasoning/thinking deltas dimmed on stderr (llmhub `ReasoningDelta` passthrough); tool activity inline |

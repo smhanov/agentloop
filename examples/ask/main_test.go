@@ -460,7 +460,7 @@ func TestHelpRendersAllFlags(t *testing.T) {
 	for _, flag := range []string{
 		"-provider", "-model", "-api-key", "-base-url", "-agent", "-chat",
 		"-cache-key", "-serper-key", "-prompt", "-prompt-file", "-system",
-		"-cwd", "-env", "-skills", "-step-limit", "-cost-limit", "-confirm",
+		"-cwd", "-env", "-skills", "-step-limit", "-token-limit", "-confirm",
 		"-tool-protocol", "-stream", "-v", "-json", "-max-tool-calls", "-max-steps",
 	} {
 		if !strings.Contains(stderr, flag) {

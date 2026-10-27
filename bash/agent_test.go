@@ -185,15 +185,43 @@ func TestStepLimitGracefulStop(t *testing.T) {
 	}
 }
 
-// TestCostLimitGracefulStop: provider-reported cost reaching the limit
-// stops before the next inference with LimitsExceeded.
-func TestCostLimitGracefulStop(t *testing.T) {
+// TestTokenLimitGracefulStop: cumulative counted tokens reaching the limit
+// stop before the next inference with LimitsExceeded — nil error, core
+// StatusStopped, and Steps counts only the completed inferences.
+func TestTokenLimitGracefulStop(t *testing.T) {
 	billed := cmdTurn("THOUGHT: one", "echo one")
-	billed.usage = llmhub.UsageMetadata{Cost: 1.0}
+	billed.usage = llmhub.UsageMetadata{TotalTokens: 120000}
 	resetScript(t, billed, cmdTurn("THOUGHT: two", "echo two"))
 	agent := newFakeAgent(t,
 		WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
-		WithCostLimit(0.5),
+		WithTokenLimit(100000),
+	)
+
+	ans, err := agent.Ask(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.ExitStatus != ExitLimitsExceeded {
+		t.Errorf("ExitStatus = %q, want %q", ans.ExitStatus, ExitLimitsExceeded)
+	}
+	if ans.Status != agentloop.StatusStopped {
+		t.Errorf("Status = %v, want StatusStopped", ans.Status)
+	}
+	if ans.Steps != 1 {
+		t.Errorf("Steps = %d, want 1", ans.Steps)
+	}
+}
+
+// TestTokenLimitFallbackCounting: a provider that reports no TotalTokens
+// but populated Prompt/Completion counts is still budgeted — the sum is
+// billed either way.
+func TestTokenLimitFallbackCounting(t *testing.T) {
+	billed := cmdTurn("THOUGHT: one", "echo one")
+	billed.usage = llmhub.UsageMetadata{PromptTokens: 60000, CompletionTokens: 60000}
+	resetScript(t, billed, cmdTurn("THOUGHT: two", "echo two"))
+	agent := newFakeAgent(t,
+		WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
+		WithTokenLimit(100000),
 	)
 
 	ans, err := agent.Ask(context.Background(), "task")
@@ -205,6 +233,125 @@ func TestCostLimitGracefulStop(t *testing.T) {
 	}
 	if ans.Steps != 1 {
 		t.Errorf("Steps = %d, want 1", ans.Steps)
+	}
+}
+
+// TestTokenLimitCountsFormatErrorTurns: a malformed response is billed
+// like any other inference, so it counts toward the token budget too.
+func TestTokenLimitCountsFormatErrorTurns(t *testing.T) {
+	garbage := textTurn("no action block in this text")
+	garbage.usage = llmhub.UsageMetadata{TotalTokens: 120000}
+	resetScript(t, garbage, cmdTurn("THOUGHT: two", "echo two"))
+	agent := newFakeAgent(t,
+		WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
+		WithTokenLimit(100000),
+	)
+
+	ans, err := agent.Ask(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.ExitStatus != ExitLimitsExceeded {
+		t.Errorf("ExitStatus = %q, want %q", ans.ExitStatus, ExitLimitsExceeded)
+	}
+	if ans.Steps != 1 {
+		t.Errorf("Steps = %d, want 1", ans.Steps)
+	}
+}
+
+// TestTokenLimitUnlimitedDefault: the default 0 (and a negative value,
+// which resolution clamps to 0) never trips, no matter how large the
+// reported usage.
+func TestTokenLimitUnlimitedDefault(t *testing.T) {
+	for _, limit := range []int64{0, -5} {
+		billed := cmdTurn("THOUGHT: one", "echo one")
+		billed.usage = llmhub.UsageMetadata{TotalTokens: 1 << 30}
+		resetScript(t, billed, submitTurn("THOUGHT: done", "done"))
+		agent := newFakeAgent(t,
+			WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
+			WithTokenLimit(limit),
+		)
+
+		ans, err := agent.Ask(context.Background(), "task")
+		if err != nil {
+			t.Fatalf("Ask(limit %d): %v", limit, err)
+		}
+		if ans.ExitStatus != ExitSubmitted {
+			t.Errorf("limit %d: ExitStatus = %q, want %q (0/negative means unlimited)",
+				limit, ans.ExitStatus, ExitSubmitted)
+		}
+	}
+}
+
+// TestTokenLimitResetsPerAsk: token accounting is per-run like the other
+// limits. The first Ask ends submitted with a cumulative total past the
+// limit; a second Ask starts from zero — had the counter leaked, its very
+// first limit check would stop it with LimitsExceeded and 0 steps.
+func TestTokenLimitResetsPerAsk(t *testing.T) {
+	billed := func(turn fakeTurn) fakeTurn {
+		turn.usage = llmhub.UsageMetadata{TotalTokens: 100000}
+		return turn
+	}
+	resetScript(t,
+		billed(cmdTurn("THOUGHT: work", "echo one")),
+		billed(submitTurn("THOUGHT: done", "done")),
+		billed(cmdTurn("THOUGHT: work again", "echo two")),
+		billed(submitTurn("THOUGHT: done again", "done")),
+	)
+	agent := newFakeAgent(t,
+		WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
+		WithTokenLimit(150000),
+	)
+
+	for i := 1; i <= 2; i++ {
+		ans, err := agent.Ask(context.Background(), "task")
+		if err != nil {
+			t.Fatalf("Ask %d: %v", i, err)
+		}
+		if ans.ExitStatus != ExitSubmitted {
+			t.Errorf("Ask %d: ExitStatus = %q, want %q (the counter must reset per Ask)",
+				i, ans.ExitStatus, ExitSubmitted)
+		}
+		if ans.Steps != 2 {
+			t.Errorf("Ask %d: Steps = %d, want 2", i, ans.Steps)
+		}
+	}
+}
+
+// TestTokenLimitCountsStreamedRuns: the streaming path counts identically —
+// usage arrives via the terminal chunk and the limit trips before the next
+// inference. One provider request only: a counting miss would request the
+// second turn, exhaust the script, and surface an EventError.
+func TestTokenLimitCountsStreamedRuns(t *testing.T) {
+	billed := cmdTurn("THOUGHT: one", "echo one")
+	billed.usage = llmhub.UsageMetadata{TotalTokens: 120000}
+	resetScript(t, billed, cmdTurn("THOUGHT: two", "echo two"))
+	agent := newFakeAgent(t,
+		WithEnvironment(NewLocalEnvironment(t.TempDir(), nil, 0)),
+		WithTokenLimit(100000),
+	)
+
+	events, err := agent.AskStream(context.Background(), "task")
+	if err != nil {
+		t.Fatalf("AskStream: %v", err)
+	}
+	var done *agentloop.Answer
+	for ev := range events {
+		switch ev.Kind {
+		case agentloop.EventDone:
+			done = ev.Answer
+		case agentloop.EventError:
+			t.Errorf("stream error: %v", ev.Err)
+		}
+	}
+	if done == nil {
+		t.Fatal("no Done event")
+	}
+	if done.Status != agentloop.StatusStopped || done.Steps != 1 {
+		t.Errorf("Status = %v, Steps = %d; want StatusStopped and 1", done.Status, done.Steps)
+	}
+	if n := len(fakeRequests()); n != 1 {
+		t.Errorf("provider requests = %d, want 1 (stopped before the second inference)", n)
 	}
 }
 

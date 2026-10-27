@@ -180,7 +180,7 @@ func snippetBashAgent() {
 	agent, _ := bash.New(llm,
 		bash.WithEnvironment(bash.NewLocalEnvironment("/tmp/workspace", nil, 60*time.Second)),
 		bash.WithStepLimit(20),
-		bash.WithCostLimit(1.5))
+		bash.WithTokenLimit(2000000))
 
 	ans, err := agent.Ask(ctx, "Add a README.md describing this project.")
 	_, _ = ans, err

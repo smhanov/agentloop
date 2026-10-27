@@ -74,15 +74,16 @@ func (p *protocol) handleToolCall(ctx context.Context, args json.RawMessage) (st
 }
 
 // countStep is the tool protocol's AfterGenerate hook: it only keeps the
-// limits' counters current (model inferences and provider-reported cost).
-// Finish arrives pre-set (a response without tool calls ends the run) and
-// is left untouched — the loop's natural termination replaces the text
-// protocol's finish veto, and no message is appended here (the bash tool's
-// result already carries the observation).
+// limits' counters current (model inferences and cumulative tokens,
+// counted identically to the text protocol). Finish arrives pre-set (a
+// response without tool calls ends the run) and is left untouched — the
+// loop's natural termination replaces the text protocol's finish veto, and
+// no message is appended here (the bash tool's result already carries the
+// observation).
 func (p *protocol) countStep(ctx context.Context, ev *agentloop.Event) error {
 	p.st.steps++
 	if resp := ev.Response; resp != nil {
-		p.st.cost += resp.Usage.Cost
+		p.st.tokens += countedTokens(resp.Usage) // format-error turns are billed too
 	}
 	return nil
 }

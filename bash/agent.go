@@ -27,7 +27,7 @@ const (
 	// ExitSubmitted means the model ran the submit command: the command's
 	// first output line equaled the submit marker and the command exited 0.
 	ExitSubmitted = "Submitted"
-	// ExitLimitsExceeded means the step limit or the cost limit tripped.
+	// ExitLimitsExceeded means the step limit or the token limit tripped.
 	ExitLimitsExceeded = "LimitsExceeded"
 	// ExitTimeExceeded means the wall-time limit tripped.
 	ExitTimeExceeded = "TimeExceeded"
@@ -61,7 +61,7 @@ type Option = agentloop.Option
 const (
 	settingEnvironment  = "bash.environment"
 	settingStepLimit    = "bash.stepLimit"
-	settingCostLimit    = "bash.costLimit"
+	settingTokenLimit   = "bash.tokenLimit"
 	settingWallTime     = "bash.wallTimeLimit"
 	settingMaxFormatErr = "bash.maxConsecutiveFormatErrors"
 	settingSubmitMarker = "bash.submitMarker"
@@ -89,11 +89,16 @@ func WithStepLimit(n int) Option {
 	return agentloop.WithSetting(settingStepLimit, n)
 }
 
-// WithCostLimit stops the run gracefully once the cumulative cost reported
-// by the provider reaches usd (mini's cost_limit semantics: stop after
-// exceeding); the default 0 means unlimited. Negative values count as 0.
-func WithCostLimit(usd float64) Option {
-	return agentloop.WithSetting(settingCostLimit, usd)
+// WithTokenLimit stops the run gracefully once the cumulative counted
+// tokens reach total (checked before each inference); the default 0 means
+// unlimited and negative values count as 0. Counted tokens are the sum of
+// per-step Usage.TotalTokens, falling back to PromptTokens+CompletionTokens
+// when a provider reports no total. Cache-read tokens count, matching
+// subscription quotas. This is the budget that works on flat-rate and
+// subscription endpoints, where providers bill tokens but report
+// Usage.Cost == 0 — cost stays accounting-only via Answer.Usage.
+func WithTokenLimit(total int64) Option {
+	return agentloop.WithSetting(settingTokenLimit, total)
 }
 
 // WithWallTimeLimit stops the run gracefully once wall-clock time (a
@@ -190,7 +195,7 @@ type approverFn = func(ctx context.Context, command string) error
 type presetConfig struct {
 	environment         Environment
 	stepLimit           int
-	costLimit           float64
+	tokenLimit          int64
 	wallTimeLimit       time.Duration
 	maxConsecFormatErrs int
 	submitMarker        string
@@ -223,8 +228,8 @@ func resolvePreset(opts []Option) presetConfig {
 	if v, ok := st[settingStepLimit].(int); ok {
 		cfg.stepLimit = max(v, 0)
 	}
-	if v, ok := st[settingCostLimit].(float64); ok {
-		cfg.costLimit = max(v, 0)
+	if v, ok := st[settingTokenLimit].(int64); ok {
+		cfg.tokenLimit = max(v, 0)
 	}
 	if v, ok := st[settingWallTime].(time.Duration); ok {
 		cfg.wallTimeLimit = max(v, 0)
@@ -421,7 +426,7 @@ func (a *Agent) prepare(perAsk []Option, task string) (runExtras, *runState, err
 	coreOpts := append([]Option(nil), perAsk...)
 	if cfg.toolProtocol {
 		// Tool protocol: the native bash tool replaces the text-protocol
-		// AfterGenerate hook — only the limits' step/cost counter stays.
+		// AfterGenerate hook — only the limits' step/token counter stays.
 		// Termination is the loop's natural one (the model stops calling
 		// tools). The handler closes over this run's protocol state, so the
 		// tool is re-registered per Ask — merged with the construction-time
@@ -449,11 +454,23 @@ func (a *Agent) prepare(perAsk []Option, task string) (runExtras, *runState, err
 // runState is the per-run protocol state; it lives in locals of one Ask.
 type runState struct {
 	start      time.Time
-	steps      int     // model inferences observed so far
-	cost       float64 // cumulative provider-reported cost
-	fmtErrs    int     // consecutive malformed responses
+	steps      int   // model inferences observed so far
+	tokens     int64 // cumulative counted tokens (countedTokens per step)
+	fmtErrs    int   // consecutive malformed responses
 	exitStatus string
 	submission string
+}
+
+// countedTokens is the token budget's per-step count: the provider's
+// TotalTokens, falling back to PromptTokens+CompletionTokens when a
+// provider reports no total (the sum is billed either way). Cache-read
+// tokens arrive inside TotalTokens and count, matching subscription
+// quotas.
+func countedTokens(u llmhub.UsageMetadata) int64 {
+	if u.TotalTokens != 0 {
+		return int64(u.TotalTokens)
+	}
+	return int64(u.PromptTokens + u.CompletionTokens)
 }
 
 // protocol bundles what the hooks need for one run.
@@ -479,7 +496,7 @@ func newProtocol(cfg presetConfig, st *runState) (*protocol, error) {
 }
 
 // beforeGenerate enforces the graceful limits before each inference:
-// step count, cumulative cost, and wall-clock time. Each maps to
+// step count, cumulative tokens, and wall-clock time. Each maps to
 // mini-swe-agent's exit statuses; the wall-time limit specifically yields
 // ExitTimeExceeded. A tool call that hit the submit marker stops here too —
 // the earliest point after the execution (the tool protocol's submission
@@ -490,7 +507,7 @@ func (p *protocol) beforeGenerate(ctx context.Context, ev *agentloop.Event) erro
 	case st.exitStatus == ExitSubmitted:
 		ev.Skip = true
 	case cfg.stepLimit > 0 && st.steps >= cfg.stepLimit,
-		cfg.costLimit > 0 && st.cost >= cfg.costLimit:
+		cfg.tokenLimit > 0 && st.tokens >= cfg.tokenLimit:
 		st.exitStatus = ExitLimitsExceeded
 		ev.Skip = true
 	case cfg.wallTimeLimit > 0 && time.Since(st.start) >= cfg.wallTimeLimit:
@@ -516,7 +533,7 @@ func (p *protocol) afterGenerate(ctx context.Context, ev *agentloop.Event) error
 	st := p.st
 	st.steps++
 	if resp := ev.Response; resp != nil {
-		st.cost += resp.Usage.Cost
+		st.tokens += countedTokens(resp.Usage) // format-error turns are billed too
 	}
 	commands := findCommands(ev.Response.Text())
 	if len(commands) != 1 {

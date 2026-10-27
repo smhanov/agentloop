@@ -76,7 +76,7 @@ type appConfig struct {
 	envPairs      repeatFlags
 	skills        string
 	stepLimit     int
-	costLimit     float64
+	tokenLimit    int64
 	confirm       bool
 	toolProtocol  bool
 	stream        bool
@@ -106,7 +106,7 @@ Examples:
 
   go run ./examples/ask -provider zai -model glm-5.3-flash \
     -base-url https://api.z.ai/api/coding/paas/v4 \
-    -agent bash -cwd /tmp/workspace -step-limit 20 -cost-limit 1.5 \
+    -agent bash -cwd /tmp/workspace -step-limit 20 -token-limit 2000000 \
     -prompt "Add a README.md describing this project." -stream -v
 
 Chat mode (-chat) reads one prompt per stdin line, sharing one
@@ -157,7 +157,7 @@ func newFlagSet(cfg *appConfig, stderr io.Writer) *flag.FlagSet {
 	fs.Var(&cfg.envPairs, "env", "extra KEY=VALUE environment entry for the bash agent (repeatable)")
 	fs.StringVar(&cfg.skills, "skills", "", "comma-separated skill directories to load (works with every agent)")
 	fs.IntVar(&cfg.stepLimit, "step-limit", 0, "bash agent: maximum model steps per run (0 means unlimited)")
-	fs.Float64Var(&cfg.costLimit, "cost-limit", 0, "bash agent: stop once cumulative provider-reported cost reaches this USD value (0 means unlimited)")
+	fs.Int64Var(&cfg.tokenLimit, "token-limit", 0, "bash agent: stop once cumulative counted tokens reach this value (0 means unlimited)")
 	fs.BoolVar(&cfg.confirm, "confirm", false, "bash agent: ask before every command (reads y/n from stdin); default is unattended")
 	fs.BoolVar(&cfg.toolProtocol, "tool-protocol", false, "bash agent: native tool calling instead of the default text-action protocol")
 	fs.BoolVar(&cfg.stream, "stream", false, "stream answer deltas to stdout as they arrive; reasoning deltas dimmed on stderr; tool activity inline (the bash exit-status summary is only printed without -stream)")
@@ -382,8 +382,8 @@ func (cfg *appConfig) newAgent(stdin io.Reader, stderr io.Writer) (*agentHandle,
 		if cfg.stepLimit > 0 {
 			opts = append(opts, bash.WithStepLimit(cfg.stepLimit))
 		}
-		if cfg.costLimit > 0 {
-			opts = append(opts, bash.WithCostLimit(cfg.costLimit))
+		if cfg.tokenLimit > 0 {
+			opts = append(opts, bash.WithTokenLimit(cfg.tokenLimit))
 		}
 		if cfg.toolProtocol {
 			opts = append(opts, bash.WithToolProtocol())

@@ -10,7 +10,7 @@ import (
 )
 
 // fakeTurn is one scripted provider response for Generate. usage feeds the
-// cost-limit tests; calls simulate a misbehaving provider that answers
+// token-limit tests; calls simulate a misbehaving provider that answers
 // with native tool calls instead of the text protocol.
 type fakeTurn struct {
 	text  string
@@ -91,12 +91,16 @@ func (fakeProvider) Stream(ctx context.Context, prompt []*llmhub.Message, opts .
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan llmhub.StreamChunk, 2)
+	ch := make(chan llmhub.StreamChunk, 4)
 	if turn.text != "" {
 		ch <- llmhub.StreamChunk{Delta: turn.text}
 	}
 	for _, call := range turn.calls {
 		ch <- llmhub.StreamChunk{ToolCalls: []*llmhub.ToolCallContent{call}}
+	}
+	if turn.usage != (llmhub.UsageMetadata{}) {
+		u := turn.usage
+		ch <- llmhub.StreamChunk{Usage: &u} // the terminal usage snapshot
 	}
 	ch <- llmhub.StreamChunk{Done: true}
 	close(ch)

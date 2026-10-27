@@ -148,7 +148,7 @@ go run ./examples/ask \
 # Bash coding agent: solves a task by executing commands in a workspace
 go run ./examples/ask -provider zai -model glm-5.3-flash \
   -base-url https://api.z.ai/api/coding/paas/v4 \
-  -agent bash -cwd /tmp/workspace -step-limit 20 -cost-limit 1.5 \
+  -agent bash -cwd /tmp/workspace -step-limit 20 -token-limit 2000000 \
   -prompt "Add a README.md describing this project." -stream -v
 ```
 
@@ -172,7 +172,7 @@ The main flags (run `go run ./examples/ask -h` for the full list):
 | `-system` | replace the system prompt |
 | `-skills` | comma-separated skill directories to load |
 | `-cwd`, `-env` | bash agent: working directory and extra `KEY=VALUE` entries (repeatable) |
-| `-step-limit`, `-cost-limit` | bash agent limits |
+| `-step-limit`, `-token-limit` | bash agent limits |
 | `-confirm` | bash agent: prompt before every command (default: unattended) |
 | `-tool-protocol` | bash agent: native tool calling instead of the text protocol |
 | `-stream` | stream answer deltas as they arrive; reasoning dimmed on stderr; tool activity inline |
@@ -731,7 +731,7 @@ llm, _ := llmhub.New("zai", os.Getenv("ZAI_API_KEY"),
 agent, _ := bash.New(llm,
     bash.WithEnvironment(bash.NewLocalEnvironment("/tmp/workspace", nil, 60*time.Second)),
     bash.WithStepLimit(20),
-    bash.WithCostLimit(1.5))
+    bash.WithTokenLimit(2000000))
 
 ans, err := agent.Ask(ctx, "Add a README.md describing this project.")
 // ans.ExitStatus == bash.ExitSubmitted; ans.Submission holds the output
@@ -778,7 +778,7 @@ reserved for infrastructure). `Ask` returns the core trace plus:
 | `ExitStatus` | Meaning |
 | --- | --- |
 | `"Submitted"` | a command exited 0 with the submit marker (`WithSubmitMarker`, default `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`) as its first output line; `Submission` holds the remaining output |
-| `"LimitsExceeded"` | `WithStepLimit` (default 0 = unlimited) or `WithCostLimit` (cumulative provider-reported cost) tripped |
+| `"LimitsExceeded"` | `WithStepLimit` (default 0 = unlimited) or `WithTokenLimit` (cumulative counted tokens) tripped |
 | `"TimeExceeded"` | `WithWallTimeLimit` (monotonic clock) tripped |
 | `"RepeatedFormatError"` | `WithMaxConsecutiveFormatErrors` (default 3) malformed responses in a row; any clean step resets the counter |
 | `""` (empty) | tool protocol only: the model stopped calling tools — the loop's natural end |
@@ -797,7 +797,7 @@ sanctioned; `BeforeToolCall` may block for the same reason.
 | --- | --- |
 | `run(task)` message loop | core `Ask` loop; continuation via the `AfterGenerate` finish veto |
 | `step_limit` | `WithStepLimit` enforced in a `BeforeGenerate` hook → graceful stop, `ExitStatus="LimitsExceeded"` |
-| `cost_limit` (stop after exceeding) | same hook, cumulative `Usage.Cost` across steps |
+| `cost_limit` (stop after exceeding) | deliberate deviation: removed — flat-rate/subscription endpoints report `$0.00`; `WithTokenLimit` (cumulative counted tokens, same hook) is the budget that works there, and `Usage.Cost` stays accounting-only |
 | `wall_time_limit_seconds` | same hook, monotonic clock → `"TimeExceeded"` |
 | `max_consecutive_format_errors` (3) | text-protocol counter → `"RepeatedFormatError"` |
 | `Submitted` + submission capture | submit-marker detection on command output |
@@ -810,7 +810,7 @@ sanctioned; `BeforeToolCall` may block for the same reason.
 | --- | --- | --- |
 | `WithEnvironment(env)` | `NewLocalEnvironment("", nil, 0)` | Command execution backend. |
 | `WithStepLimit(n)` | 0 (unlimited) | Max model steps per run. The core's hard `MaxSteps` is raised to `max(StepLimit, 2*MaxToolCalls+2)` as the safety net. |
-| `WithCostLimit(usd)` | 0 (unlimited) | Graceful stop once cumulative reported cost reaches `usd`. |
+| `WithTokenLimit(n)` | 0 (unlimited) | Graceful stop once cumulative counted tokens reach `n`: Σ per-step `TotalTokens`, with a `PromptTokens+CompletionTokens` fallback for providers that report no total. Cache-read tokens count, matching subscription quotas. |
 | `WithWallTimeLimit(d)` | 0 (unlimited) | Graceful wall-clock stop. |
 | `WithMaxConsecutiveFormatErrors(n)` | 3 | Malformed-response stop; 0 = unlimited. |
 | `WithSubmitMarker(s)` | mini's marker | The output line that ends a run as `Submitted`. |
@@ -819,6 +819,14 @@ sanctioned; `BeforeToolCall` may block for the same reason.
 | `WithApprover(fn)` | nil (yolo) | Approval gate before every command. |
 | `WithToolProtocol()` | text protocol | Native tool-calling transport. |
 | `WithHooks(h)` | — | **Composes** with the protocol's internal hooks (protocol first, then yours). Prefer it over `agentloop.WithHooks`, which replaces the whole hook set and would silently disable the protocol. |
+
+**Choosing a budget.** `WithTokenLimit` is the budget that works on
+flat-rate and subscription endpoints, where providers bill tokens but
+report `$0.00` cost — the failure mode a cost limit can never catch.
+Step and wall-clock limits are last-resort proxies that bound runaway
+runs, not spending. If you think in USD on metered endpoints, configure
+per-model rates with `llmhub.WithCost` and read the estimate from
+`Answer.Usage.Cost`; the loop itself never stops on cost.
 
 **Streaming note.** `AskStream` forwards the core events exactly, but
 `ExitStatus` and `Submission` are attached only to `bash.Ask`'s result —
