@@ -286,6 +286,7 @@ per-call options apply after the constructor's, so the later one wins.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `WithSystemPrompt(p)` | none | Prepends a system message to every `Ask`. Byte-stable for the agent's lifetime — dynamic facts belong in the query text. |
+| `WithPrefix(msgs ...*llmhub.Message)` | none | Seeds a one-shot `Ask`/`AskStream` transcript with prior messages; `Answer.Messages` carries the full transcript (see [Seeding history from external state](#conversations)). |
 | `WithTools(t ...Tool)` | none | Replaces the registered tool set. Keep it small: schemas are sent to the model on every inference. |
 | `WithMaxToolCalls(n)` | 5 (min 1) | Tool executions allowed per `Ask`. Once spent, the loop forces a final answer (see [Budgets](#budgets-and-loop-safety)). |
 | `WithMaxSteps(n)` | `2*MaxToolCalls+2` | Hard ceiling on model inferences per `Ask`; exceeding it fails with `ErrBudgetExhausted`. |
@@ -596,6 +597,41 @@ second, err := conv.Ask(ctx, "And when is the next one expected?")
   with `WithCompactor(agentloop.NewTokenCompactor(...))` (see
   [Context compaction](#writing-your-own-agent)) or derive one with a
   `RebuildContext` hook; the conversation log stays complete.
+
+**Seeding history from external state.** When the conversation lives
+outside the process — a database, a queue, a replicated log — hand the
+prior messages to a one-shot `Ask`/`AskStream` with
+`WithPrefix(history...)`. The prefix becomes the head of the run's
+transcript: the model is sent prefix + query + the run's own steps, every
+hook sees it in `ev.Messages`, and `Answer.Messages` is the **full**
+transcript, prefix included. Persist `ans.Messages` wholesale and pass it
+back as the next call's prefix; no `RebuildContext` workaround, and no
+divergence between the stored transcript and what the model saw.
+
+A prefix owns the opening messages, so the configured system prompt is
+**not** auto-prepended: include the system message in the prefix — the
+same convention `Conversation` uses, where the frozen system message
+travels inside the history. A per-call `WithPrefix` replaces a
+construction-time prefix. On a `Conversation` turn `WithPrefix` is
+ignored, because the conversation's own history is the prefix (and its
+`Answer.Messages` keeps carrying only that turn's messages). With a
+compactor, the first message stays verbatim as always — with a prefix,
+that is the prefix's opening message.
+
+```go
+history, err := store.Load(ctx, sessionID) // []*llmhub.Message from your DB
+if err != nil {
+    log.Fatal(err)
+}
+ans, err := agent.Ask(ctx, "And when is the next one expected?",
+    agentloop.WithPrefix(history...))
+if err != nil {
+    log.Fatal(err)
+}
+if err := store.Save(ctx, sessionID, ans.Messages); err != nil {
+    log.Fatal(err)
+}
+```
 
 ## Skills
 

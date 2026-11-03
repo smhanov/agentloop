@@ -87,12 +87,17 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 	}
 
 	// Seed the transcript. Plain Asks seed the configured system message
-	// and keep it in Answer.Messages (prefixLen 0); conversation runs
+	// and keep it in Answer.Messages (prefixLen 0); one-shot runs with a
+	// caller-supplied prefix seed that prefix instead, skipping the system
+	// message because the caller owns the opening messages (prefixLen 0
+	// keeps the full transcript in Answer.Messages); conversation runs
 	// receive the byte-stable system message inside the prefix, and
 	// Answer.Messages carries only this run's own messages.
 	r.prefixLen = 0
 	if r.prefix == nil {
-		if r.cfg.systemPrompt != "" {
+		if r.cfg.prefix != nil {
+			r.transcript = append(r.transcript, normalizedPrefix(r.cfg.prefix)...)
+		} else if r.cfg.systemPrompt != "" {
 			r.transcript = append(r.transcript, llmhub.NewSystemMessage(llmhub.Text(r.cfg.systemPrompt)))
 		}
 	} else {
@@ -269,6 +274,37 @@ func normalizeToolCallArgs(resp *llmhub.Response) {
 			call.Arguments = "{}"
 		}
 	}
+}
+
+// normalizedPrefix copies msgs and applies the same empty-arguments
+// normalization to caller-supplied history: a tool call with no arguments
+// is cloned with "{}" so the injected transcript is provider-valid, while
+// every other message and part stays shared and the caller's slice and
+// objects are never mutated.
+func normalizedPrefix(msgs []*llmhub.Message) []*llmhub.Message {
+	out := append([]*llmhub.Message(nil), msgs...)
+	for i, msg := range out {
+		if msg == nil {
+			continue
+		}
+		var content []llmhub.ContentPart
+		for j, part := range msg.Content {
+			call, ok := part.(*llmhub.ToolCallContent)
+			if !ok || call.Arguments != "" {
+				continue
+			}
+			if content == nil {
+				content = append([]llmhub.ContentPart(nil), msg.Content...)
+				clone := *msg
+				clone.Content = content
+				out[i] = &clone
+			}
+			copied := *call
+			copied.Arguments = "{}"
+			content[j] = &copied
+		}
+	}
+	return out
 }
 
 // infer performs one model inference for the current step: Generate in ask

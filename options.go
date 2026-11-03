@@ -33,7 +33,11 @@ type config struct {
 	generateOptions []llmhub.Option
 	hooks           Hooks
 	compactor       Compactor
-	settings        map[string]any
+	// prefix seeds a one-shot run's transcript with prior conversation
+	// messages (WithPrefix). Conversation runs set their own prefix on the
+	// run instead, so this field is ignored there.
+	prefix   []*llmhub.Message
+	settings map[string]any
 	// skillDirs and pinnedNames record construction-time skill intent
 	// (WithSkills / WithPinnedSkills). resolveSkills consumes them once in
 	// New, so the catalog and pinned bodies are frozen at construction;
@@ -79,6 +83,33 @@ type Option func(*config)
 // query text.
 func WithSystemPrompt(p string) Option {
 	return func(c *config) { c.systemPrompt = p }
+}
+
+// WithPrefix seeds the run's transcript with prior conversation messages:
+// the model is sent prefix + query + the run's own steps, every hook sees
+// the prefix in ev.Messages, and Answer.Messages carries the full
+// transcript, prefix included. Store Answer.Messages and pass it back as
+// the next call's prefix to continue a conversation whose state lives
+// outside the process (a database, a queue, a replicated log).
+//
+// When a prefix is set the configured system prompt is not prepended: the
+// caller owns the opening messages, so include the system message in the
+// prefix — the same convention Conversation uses, where the frozen system
+// message travels inside the history. The messages are copied, and a tool
+// call with empty arguments is normalized to "{}" on the copy; the
+// caller's messages are never mutated. Nil or empty input is a no-op.
+//
+// A Conversation turn ignores WithPrefix: the conversation's own history is
+// the prefix, and its Answer.Messages keeps carrying only that turn's
+// messages. The full-transcript semantics apply to one-shot Ask and
+// AskStream only.
+func WithPrefix(messages ...*llmhub.Message) Option {
+	return func(c *config) {
+		if len(messages) == 0 {
+			return
+		}
+		c.prefix = append([]*llmhub.Message(nil), messages...)
+	}
 }
 
 // WithTools replaces the registered tool set. Keep the set small: tool

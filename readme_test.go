@@ -145,6 +145,24 @@ func snippetConversations(agent *agentloop.Agent) {
 	_, _ = second, err
 }
 
+// README: Conversations (seeding history from external state).
+func snippetSeedHistory(agent *agentloop.Agent, store historyStore, sessionID string) {
+	ctx := context.Background()
+
+	history, err := store.Load(ctx, sessionID) // []*llmhub.Message from your DB
+	if err != nil {
+		log.Fatal(err)
+	}
+	ans, err := agent.Ask(ctx, "And when is the next one expected?",
+		agentloop.WithPrefix(history...))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := store.Save(ctx, sessionID, ans.Messages); err != nil {
+		log.Fatal(err)
+	}
+}
+
 // README: Skills (diagnosing dropped skills).
 func snippetSkillIssues(llm *llmhub.Client) error {
 	ag, err := agentloop.New(llm, agentloop.WithSkills("path/to/skills-root"))
@@ -406,6 +424,12 @@ type shellSession struct{ dir string }
 
 func (s *shellSession) Run(ctx context.Context, command string) (string, error) {
 	return "ran in " + s.dir + ": " + command, nil
+}
+
+// historyStore is the external conversation store the seeding snippet uses.
+type historyStore interface {
+	Load(ctx context.Context, sessionID string) ([]*llmhub.Message, error)
+	Save(ctx context.Context, sessionID string, messages []*llmhub.Message) error
 }
 
 // protocolPrompt, parseAction, and runAndObserve back the finish-veto
