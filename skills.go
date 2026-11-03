@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -70,22 +71,32 @@ type Skill struct {
 	// Body is the SKILL.md markdown below the frontmatter, with
 	// invisible characters stripped (steganography defense).
 	Body string
-	// Dir is the resolved absolute path of the skill folder.
+	// Dir is the skill folder: the resolved absolute path for skills loaded
+	// from disk with LoadSkills/WithSkills, or the slash path relative to
+	// the filesystem root for skills loaded from an fs.FS with
+	// LoadSkillsFS/WithSkillsFS (for example "skills/my-skill").
 	Dir string
 	// LinkedFiles lists the skill's resource files: relative slash paths
-	// under references/ and assets/, precomputed (symlinks resolved,
-	// escapes dropped, sorted) so the model never needs to list the
-	// directory. Scripts under scripts/ are deliberately not listed:
+	// under references/ and assets/, precomputed and sorted so the model
+	// never needs to list the directory. For disk roots symlinks are
+	// resolved and escapes dropped; for fs.FS sources paths are lexical and
+	// symlink-typed entries are skipped. Scripts under scripts/ are
+	// deliberately not listed:
 	// they run via an execution tool and only their output enters
 	// context (L3).
 	LinkedFiles []string
 	// ScriptFiles lists the skill's executable helpers: relative slash
-	// paths under scripts/, precomputed like LinkedFiles (symlinks
-	// resolved, escapes dropped, sorted) so the body can reference them.
-	// They are advertised for execution, never for reading: run them
-	// through the agent's execution tool from Dir and only their output
-	// enters context (L3).
+	// paths under scripts/, precomputed like LinkedFiles and sorted so the
+	// body can reference them. They are advertised for execution, never for
+	// reading: run them through the agent's execution tool from Dir and only
+	// their output enters context (L3). Executing scripts that live inside
+	// an fs.FS (an embed.FS, for example) is the caller's concern — extract
+	// or mount them first.
 	ScriptFiles []string
+	// backend is the filesystem the skill was loaded from; nil means the
+	// OS. It stays unexported so hand-built Skill values keep working and
+	// callers cannot inject arbitrary backends into skill_read.
+	backend skillBackend
 }
 
 // SkillIssue reports a fail-closed outcome of skill loading: either a
@@ -104,6 +115,174 @@ type SkillIssue struct {
 	// "name mismatch", "empty body", "duplicate skill", or
 	// "unicode steganography stripped".
 	Reason string
+}
+
+// skillBackend abstracts the filesystem operations the skill loader
+// performs, so LoadSkills and LoadSkillsFS share one validation path. Paths
+// are in the backend's own namespace: native OS paths for osBackend, slash
+// paths rooted at the fs.FS for fsBackend.
+type skillBackend interface {
+	readDir(dir string) ([]fs.DirEntry, error)
+	statFile(path string) (fs.FileInfo, error)
+	readFile(path string) ([]byte, error)
+	listFiles(dir string, subs []string) ([]string, error)
+	base(path string) string
+}
+
+// osPathSemantics is the optional capability of backends that live in the
+// OS path namespace: roots are made absolute before scanning and directory
+// symlinks are resolved. An fs.FS namespace has no absolute paths and
+// io/fs offers no symlink resolution, so fsBackend does not implement it.
+type osPathSemantics interface {
+	absRoot(root string) (string, error)
+	resolveDir(path string) (string, error)
+}
+
+// osBackend loads skills from directories on disk, with the symlink
+// resolution and jail the disk loader has always used.
+type osBackend struct{}
+
+func (osBackend) absRoot(root string) (string, error)    { return filepath.Abs(root) }
+func (osBackend) resolveDir(path string) (string, error) { return filepath.EvalSymlinks(path) }
+func (osBackend) readDir(dir string) ([]fs.DirEntry, error) {
+	return os.ReadDir(dir)
+}
+func (osBackend) statFile(path string) (fs.FileInfo, error) { return os.Stat(path) }
+func (osBackend) readFile(path string) ([]byte, error)      { return os.ReadFile(path) }
+func (osBackend) base(path string) string                   { return filepath.Base(path) }
+
+// listFiles is the disk walk behind linkedFiles and scriptFiles: every
+// regular file under the given optional subdirectories of dir, as slash
+// paths relative to dir. Symlinks are resolved; files whose real location
+// escapes dir are dropped, as are symlinked directories. The result is
+// sorted and deduplicated across all listed subdirectories.
+func (osBackend) listFiles(dir string, subs []string) ([]string, error) {
+	var files []string
+	seen := make(map[string]bool)
+	for _, sub := range subs {
+		root := filepath.Join(dir, sub)
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					return fs.SkipAll // optional directory is absent
+				}
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			real, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return nil // unreadable entry: drop it
+			}
+			if info, err := os.Stat(real); err != nil || info.IsDir() {
+				return nil // broken link or symlinked directory: skip
+			}
+			rel, err := filepath.Rel(dir, real)
+			if err != nil || escapesDir(rel) || seen[rel] {
+				return nil
+			}
+			seen[rel] = true
+			files = append(files, filepath.ToSlash(rel))
+			return nil
+		})
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// fsBackend loads skills from any fs.FS: an embed.FS, os.DirFS, a
+// fstest.MapFS, or a custom filesystem. Paths are slash paths rooted at the
+// filesystem; io/fs offers no symlink resolution, so the jail is lexical
+// and symlink-typed entries are skipped.
+type fsBackend struct{ fsys fs.FS }
+
+func (b fsBackend) readDir(dir string) ([]fs.DirEntry, error) {
+	return fs.ReadDir(b.fsys, dir)
+}
+func (b fsBackend) statFile(path string) (fs.FileInfo, error) { return fs.Stat(b.fsys, path) }
+func (b fsBackend) readFile(path string) ([]byte, error)      { return fs.ReadFile(b.fsys, path) }
+func (b fsBackend) base(p string) string                      { return path.Base(p) }
+
+// listFiles walks the fs.FS counterparts of osBackend.listFiles. Missing
+// optional directories are fine. io/fs has no ReadLink, so an entry that
+// reports itself as a symlink cannot be resolved and is skipped rather
+// than followed; an entry that reports as a regular file is one.
+func (b fsBackend) listFiles(dir string, subs []string) ([]string, error) {
+	var files []string
+	seen := make(map[string]bool)
+	for _, sub := range subs {
+		root := path.Join(dir, sub)
+		err := fs.WalkDir(b.fsys, root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					return fs.SkipAll // optional directory is absent
+				}
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if d.Type()&fs.ModeSymlink != 0 {
+				return nil // no ReadLink in io/fs: skip, never follow
+			}
+			info, err := fs.Stat(b.fsys, p)
+			if err != nil || info.IsDir() {
+				return nil // unreadable entry or directory entry: skip
+			}
+			rel, ok := slashRel(dir, p)
+			if !ok || escapesSlashDir(rel) || seen[rel] {
+				return nil
+			}
+			seen[rel] = true
+			files = append(files, rel)
+			return nil
+		})
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// slashRel returns p relative to dir for slash paths, and whether p is
+// inside dir. The special directory "." makes p its own relative path.
+func slashRel(dir, p string) (string, bool) {
+	dir = path.Clean(dir)
+	if dir == "." {
+		return p, true
+	}
+	prefix := dir + "/"
+	if !strings.HasPrefix(p, prefix) {
+		return "", false
+	}
+	return p[len(prefix):], true
+}
+
+// escapesSlashDir reports whether rel, a slash path relative to a skill
+// directory, points outside it.
+func escapesSlashDir(rel string) bool {
+	return strings.HasPrefix(rel, "/") || rel == ".." || strings.HasPrefix(rel, "../")
+}
+
+// skillJoin joins path elements in the backend's namespace.
+func skillJoin(backend skillBackend, elems ...string) string {
+	if _, ok := backend.(fsBackend); ok {
+		return path.Join(elems...)
+	}
+	return filepath.Join(elems...)
+}
+
+// skillSource is one backend plus the roots to scan from it. WithSkills and
+// WithSkillsFS append sources in option order, which is also precedence
+// order.
+type skillSource struct {
+	backend skillBackend
+	roots   []string
 }
 
 // LoadSkills scans the given skills roots — directories whose immediate
@@ -126,77 +305,135 @@ type SkillIssue struct {
 // name, description, and body; when stripping changed anything an advisory
 // SkillIssue ("unicode steganography stripped") is recorded and the
 // sanitized skill proceeds through validation.
+//
+// LoadSkillsFS loads the same packs from an fs.FS. WithSkills and
+// WithSkillsFS compose in option order; when both are configured, the
+// first occurrence of a name across the ordered sources wins.
 func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error) {
+	return loadSkills([]skillSource{{backend: osBackend{}, roots: dirs}})
+}
+
+// LoadSkillsFS is LoadSkills for any fs.FS — an embed.FS, os.DirFS, a
+// fstest.MapFS, or a custom filesystem — so a skill pack can ship inside
+// the binary without a writable temporary directory. It applies the same
+// validation, fail-closed issues, catalog fields, pinning, and skill_read
+// behavior as LoadSkills.
+//
+// Roots are slash paths relative to the filesystem root, not OS paths:
+// fs.ValidPath governs them, so a leading slash or a ".." element is
+// invalid (pass "." to scan the filesystem root). A root that is
+// missing or not a directory yields an issue, not an error, exactly like
+// the disk loader. There is no ReadLink in io/fs, so the loader has no
+// symlink resolution to perform: the linked-file jail is lexical
+// (fs.ValidPath plus a references/ or assets/ prefix), and entries that
+// report themselves as symlinks are skipped during scans rather than
+// followed. Entry types follow the underlying filesystem, so an os.DirFS
+// tree behaves differently from the same tree passed to WithSkills (which
+// resolves symlinks and drops escaping targets). Use WithSkills for disk
+// roots that rely on symlinks.
+//
+// Skill.Dir is the fs-relative slash path of the skill folder. Scripts
+// under a skill's scripts/ directory are listed for the execution tool but
+// are not readable through skill_read; executing embedded scripts is the
+// caller's concern (extract or mount them first).
+func LoadSkillsFS(fsys fs.FS, roots ...string) ([]Skill, []SkillIssue, error) {
+	if fsys == nil {
+		return nil, nil, fmt.Errorf("agentloop: load skills: %w: nil filesystem", ErrInvalidInput)
+	}
+	return loadSkills([]skillSource{{backend: fsBackend{fsys: fsys}, roots: roots}})
+}
+
+// loadSkills is the shared loader behind LoadSkills and LoadSkillsFS. Each
+// source is scanned in order; the seen map spans all sources, so the first
+// occurrence of a skill name wins across backends.
+func loadSkills(sources []skillSource) ([]Skill, []SkillIssue, error) {
 	var (
 		skills []Skill
 		issues []SkillIssue
 		seen   = make(map[string]bool)
 	)
-	for _, root := range dirs {
-		absRoot, err := filepath.Abs(root)
-		if err != nil {
-			return skills, issues, fmt.Errorf("agentloop: load skills: resolve %q: %w", root, err)
-		}
-		entries, err := os.ReadDir(absRoot)
-		if err != nil {
-			if errors.Is(err, fs.ErrPermission) {
-				// A scan root we are not allowed to look at is a
-				// systemic failure, not a bad skill folder.
-				return skills, issues, fmt.Errorf("agentloop: load skills: scan %q: %w", root, err)
+	for _, source := range sources {
+		backend := source.backend
+		for _, root := range source.roots {
+			rootPath := root
+			if ops, ok := backend.(osPathSemantics); ok {
+				absRoot, err := ops.absRoot(root)
+				if err != nil {
+					return skills, issues, fmt.Errorf("agentloop: load skills: resolve %q: %w", root, err)
+				}
+				rootPath = absRoot
 			}
-			issues = append(issues, SkillIssue{Dir: root, Reason: issueUnreadableDir})
-			continue
-		}
-		// Root-shape guard: a directory that itself contains SKILL.md is
-		// a skill folder, not a skills root — the documented convention
-		// puts SKILL.md one level down, in each child. Without this guard
-		// the mis-shaped argument degrades into misleading per-child
-		// "missing SKILL.md" issues, or into nothing at all for a bare
-		// folder. Report it once, distinctly, and move on to the next
-		// root. A legitimate root never contains a top-level SKILL.md
-		// file, so this cannot misfire; the IsDir check keeps a
-		// pathologically named SKILL.md directory a child-scan matter.
-		if info, err := os.Stat(filepath.Join(absRoot, skillFileName)); err == nil && !info.IsDir() {
-			issues = append(issues, SkillIssue{
-				Dir:    absRoot,
-				Name:   filepath.Base(absRoot),
-				Reason: issueNotSkillsRoot,
-			})
-			continue
-		}
-		names := make([]string, 0, len(entries))
-		byName := make(map[string]fs.DirEntry, len(entries))
-		for _, entry := range entries {
-			names = append(names, entry.Name())
-			byName[entry.Name()] = entry
-		}
-		sort.Strings(names) // deterministic scan order
-		for _, name := range names {
-			path := filepath.Join(absRoot, name)
-			info, err := os.Stat(path) // follows symlinks to directories
+			entries, err := backend.readDir(rootPath)
 			if err != nil {
-				issues = append(issues, SkillIssue{Dir: path, Name: filepath.Base(path), Reason: issueUnreadableDir})
+				if errors.Is(err, fs.ErrPermission) {
+					// A scan root we are not allowed to look at is a
+					// systemic failure, not a bad skill folder.
+					return skills, issues, fmt.Errorf("agentloop: load skills: scan %q: %w", root, err)
+				}
+				issues = append(issues, SkillIssue{Dir: root, Reason: issueUnreadableDir})
 				continue
 			}
-			if !info.IsDir() {
-				continue // an ordinary file is not a skill attempt
-			}
-			resolved, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				issues = append(issues, SkillIssue{Dir: path, Name: filepath.Base(path), Reason: issueUnreadableDir})
+			// Root-shape guard: a directory that itself contains SKILL.md is
+			// a skill folder, not a skills root — the documented convention
+			// puts SKILL.md one level down, in each child. Without this guard
+			// the mis-shaped argument degrades into misleading per-child
+			// "missing SKILL.md" issues, or into nothing at all for a bare
+			// folder. Report it once, distinctly, and move on to the next
+			// root. A legitimate root never contains a top-level SKILL.md
+			// file, so this cannot misfire; the IsDir check keeps a
+			// pathologically named SKILL.md directory a child-scan matter.
+			if info, err := backend.statFile(skillJoin(backend, rootPath, skillFileName)); err == nil && !info.IsDir() {
+				issues = append(issues, SkillIssue{
+					Dir:    rootPath,
+					Name:   backend.base(rootPath),
+					Reason: issueNotSkillsRoot,
+				})
 				continue
 			}
-			skill, skillIssues, ok := loadOneSkill(resolved)
-			issues = append(issues, skillIssues...)
-			if !ok {
-				continue
+			names := make([]string, 0, len(entries))
+			byName := make(map[string]fs.DirEntry, len(entries))
+			for _, entry := range entries {
+				names = append(names, entry.Name())
+				byName[entry.Name()] = entry
 			}
-			if seen[skill.Name] {
-				issues = append(issues, SkillIssue{Dir: resolved, Name: skill.Name, Reason: issueDuplicate})
-				continue
+			sort.Strings(names) // deterministic scan order
+			for _, name := range names {
+				childPath := skillJoin(backend, rootPath, name)
+				if _, ok := backend.(fsBackend); ok {
+					if entry := byName[name]; entry != nil && entry.Type()&fs.ModeSymlink != 0 {
+						// io/fs cannot resolve symlinks; skip a
+						// symlink-typed child rather than follow it.
+						continue
+					}
+				}
+				info, err := backend.statFile(childPath) // OS stat follows symlinks to directories
+				if err != nil {
+					issues = append(issues, SkillIssue{Dir: childPath, Name: backend.base(childPath), Reason: issueUnreadableDir})
+					continue
+				}
+				if !info.IsDir() {
+					continue // an ordinary file is not a skill attempt
+				}
+				resolved := childPath
+				if ops, ok := backend.(osPathSemantics); ok {
+					resolved, err = ops.resolveDir(childPath)
+					if err != nil {
+						issues = append(issues, SkillIssue{Dir: childPath, Name: backend.base(childPath), Reason: issueUnreadableDir})
+						continue
+					}
+				}
+				skill, skillIssues, ok := loadOneSkill(backend, resolved)
+				issues = append(issues, skillIssues...)
+				if !ok {
+					continue
+				}
+				if seen[skill.Name] {
+					issues = append(issues, SkillIssue{Dir: resolved, Name: skill.Name, Reason: issueDuplicate})
+					continue
+				}
+				seen[skill.Name] = true
+				skills = append(skills, skill)
 			}
-			seen[skill.Name] = true
-			skills = append(skills, skill)
 		}
 	}
 	return skills, issues, nil
@@ -206,13 +443,13 @@ func LoadSkills(dirs ...string) ([]Skill, []SkillIssue, error) {
 // ok=true, or ok=false with the accumulated issues explaining the
 // rejection (which may include a sanitization advisory recorded before a
 // later validation failure).
-func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
+func loadOneSkill(backend skillBackend, dir string) (Skill, []SkillIssue, bool) {
 	var issues []SkillIssue
 	fail := func(reason string) (Skill, []SkillIssue, bool) {
-		return Skill{}, append(issues, SkillIssue{Dir: dir, Name: filepath.Base(dir), Reason: reason}), false
+		return Skill{}, append(issues, SkillIssue{Dir: dir, Name: backend.base(dir), Reason: reason}), false
 	}
 
-	raw, err := os.ReadFile(filepath.Join(dir, skillFileName))
+	raw, err := backend.readFile(skillJoin(backend, dir, skillFileName))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return fail(issueMissingSkillMD)
@@ -244,7 +481,7 @@ func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
 	if !skillNameRe.MatchString(name) || len(name) > maxSkillNameLen {
 		return fail(issueInvalidName)
 	}
-	if name != filepath.Base(dir) {
+	if name != backend.base(dir) {
 		return fail(issueNameMismatch)
 	}
 	switch n := utf8.RuneCountInString(description); {
@@ -256,11 +493,11 @@ func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
 	if body == "" {
 		return fail(issueEmptyBody)
 	}
-	linked, err := linkedFiles(dir)
+	linked, err := linkedFiles(backend, dir)
 	if err != nil {
 		return fail(issueUnreadableDir)
 	}
-	scripts, err := scriptFiles(dir)
+	scripts, err := scriptFiles(backend, dir)
 	if err != nil {
 		return fail(issueUnreadableDir)
 	}
@@ -271,6 +508,7 @@ func loadOneSkill(dir string) (Skill, []SkillIssue, bool) {
 		Dir:         dir,
 		LinkedFiles: linked,
 		ScriptFiles: scripts,
+		backend:     backend,
 	}, issues, true
 }
 
@@ -370,12 +608,13 @@ func isHiddenChar(r rune) bool {
 
 // linkedFiles lists the skill's resource files: every regular file under
 // references/ and assets/, as slash paths relative to the skill
-// directory. Symlinks are resolved; files whose real location escapes the
-// skill directory are dropped, as are symlinked directories. The result
-// is sorted and deduplicated. Missing resource directories are fine (they
-// are optional); other walk errors are systemic and returned.
-func linkedFiles(dir string) ([]string, error) {
-	return skillFiles(dir, "references", "assets")
+// directory. For disk roots symlinks are resolved and files whose real
+// location escapes the skill directory are dropped, as are symlinked
+// directories; an fs.FS has no symlinks, so its paths are lexical. The
+// result is sorted and deduplicated. Missing resource directories are fine
+// (they are optional); other walk errors are systemic and returned.
+func linkedFiles(backend skillBackend, dir string) ([]string, error) {
+	return backend.listFiles(dir, []string{"references", "assets"})
 }
 
 // scriptFiles lists the skill's executable helpers: every regular file
@@ -383,51 +622,8 @@ func linkedFiles(dir string) ([]string, error) {
 // scripts/ is fine; other walk errors are systemic and returned, so an
 // unreadable scripts tree fails the skill rather than silently hiding
 // runnable helpers.
-func scriptFiles(dir string) ([]string, error) {
-	return skillFiles(dir, "scripts")
-}
-
-// skillFiles lists every regular file under the given optional
-// subdirectories of dir, as slash paths relative to dir. Symlinks are
-// resolved; files whose real location escapes dir are dropped, as are
-// symlinked directories. The result is sorted and deduplicated across all
-// listed subdirectories.
-func skillFiles(dir string, subs ...string) ([]string, error) {
-	var files []string
-	seen := make(map[string]bool)
-	for _, sub := range subs {
-		root := filepath.Join(dir, sub)
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					return fs.SkipAll // optional directory is absent
-				}
-				return err
-			}
-			if d.IsDir() {
-				return nil
-			}
-			real, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				return nil // unreadable entry: drop it
-			}
-			if info, err := os.Stat(real); err != nil || info.IsDir() {
-				return nil // broken link or symlinked directory: skip
-			}
-			rel, err := filepath.Rel(dir, real)
-			if err != nil || escapesDir(rel) || seen[rel] {
-				return nil
-			}
-			seen[rel] = true
-			files = append(files, filepath.ToSlash(rel))
-			return nil
-		})
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return nil, err
-		}
-	}
-	sort.Strings(files)
-	return files, nil
+func scriptFiles(backend skillBackend, dir string) ([]string, error) {
+	return backend.listFiles(dir, []string{"scripts"})
 }
 
 // escapesDir reports whether rel, a path relative to a skill directory,
@@ -449,8 +645,57 @@ func escapesDir(rel string) bool {
 // skill_read tool; passing it to Ask or AskStream has no effect. A scan
 // root that cannot be read at all (for example permission-denied) fails
 // construction.
+//
+// WithSkills composes with WithSkillsFS in option order: sources are
+// scanned in the order their options were applied, and the first
+// occurrence of a skill name across all of them wins.
 func WithSkills(dirs ...string) Option {
-	return func(c *config) { c.skillDirs = append(c.skillDirs, dirs...) }
+	return func(c *config) {
+		if len(dirs) == 0 {
+			return
+		}
+		c.skillSources = append(c.skillSources, skillSource{
+			backend: osBackend{},
+			roots:   append([]string(nil), dirs...),
+		})
+	}
+}
+
+// WithSkillsFS is WithSkills for any fs.FS — an embed.FS, os.DirFS, a
+// fstest.MapFS, or a custom filesystem — so a skill pack can ship inside
+// the binary. It loads the skill folders found in the given roots in
+// precedence order and otherwise behaves exactly like WithSkills: the
+// same validation, fail-closed SkillIssues on Agent.SkillIssues, catalog
+// in the system prompt, and skill_read tool.
+//
+// Roots are slash paths relative to the filesystem root, not OS paths:
+// fs.ValidPath governs them (no leading slash, no "." or ".." elements;
+// pass "." to scan the filesystem root). There are no symlinks in an
+// fs.FS (io/fs has no ReadLink), so linked-file reads are jailed lexically
+// rather than with EvalSymlinks and entries that report themselves as
+// symlinks are skipped during scans. An os.DirFS tree therefore behaves
+// differently from the same tree passed to WithSkills; use WithSkills for
+// disk roots that rely on symlinks. Skill.Dir is the fs-relative slash
+// path of the skill folder. Executing
+// scripts embedded in the filesystem is the caller's concern: skill_read
+// lists them but never reads them, so extract or mount them before
+// running them through an execution tool. A nil filesystem or an empty
+// root list is a no-op.
+//
+// WithSkillsFS composes with WithSkills in option order: sources are
+// scanned in the order their options were applied, and the first
+// occurrence of a skill name across all of them wins. Like WithSkills this
+// is a construction-time option; per-call use has no effect.
+func WithSkillsFS(fsys fs.FS, roots ...string) Option {
+	return func(c *config) {
+		if fsys == nil || len(roots) == 0 {
+			return
+		}
+		c.skillSources = append(c.skillSources, skillSource{
+			backend: fsBackend{fsys: fsys},
+			roots:   append([]string(nil), roots...),
+		})
+	}
 }
 
 // WithPinnedSkills inlines the full bodies of the named skills into the
@@ -459,7 +704,7 @@ func WithSkills(dirs ...string) Option {
 // needs. At most two names are allowed: New fails with an error wrapping
 // ErrTooManyPinnedSkills when more are given, and with an error wrapping
 // ErrInvalidInput when a name is not among the loaded skills (load them
-// with WithSkills in the same construction). Like WithSkills this is a
+// with WithSkills or WithSkillsFS in the same construction). Like WithSkills this is a
 // construction-time option; per-call use has no effect.
 func WithPinnedSkills(names ...string) Option {
 	return func(c *config) { c.pinnedNames = append(c.pinnedNames, names...) }
@@ -467,7 +712,7 @@ func WithPinnedSkills(names ...string) Option {
 
 // WithRequireSkills makes construction fail when the resolved skill
 // catalog is empty: New returns an error wrapping ErrNoSkillsLoaded when
-// WithSkills and WithPinnedSkills together load zero skills — no roots
+// WithSkills/WithSkillsFS and WithPinnedSkills together load zero skills — no roots
 // configured at all, roots that exist but contain no valid skill folder,
 // or roots whose skills all failed validation. It is the boot-time check
 // for a consumer that expects skills, for example when the roots come
@@ -488,16 +733,16 @@ func WithRequireSkills() Option {
 // once, after all options have applied, so option order never matters and
 // the rendered prompt is frozen for the Agent's lifetime.
 func resolveSkills(c *config) ([]Skill, []SkillIssue, error) {
-	if len(c.skillDirs) == 0 && len(c.pinnedNames) == 0 && !c.requireSkills {
+	if len(c.skillSources) == 0 && len(c.pinnedNames) == 0 && !c.requireSkills {
 		return nil, nil, nil
 	}
-	skills, issues, err := LoadSkills(c.skillDirs...)
+	skills, issues, err := loadSkills(c.skillSources)
 	if err != nil {
 		return nil, nil, err
 	}
 	if c.requireSkills && len(skills) == 0 {
 		return nil, nil, fmt.Errorf("%w: %d configured root(s) yielded no valid skills",
-			ErrNoSkillsLoaded, len(c.skillDirs))
+			ErrNoSkillsLoaded, skillRootCount(c.skillSources))
 	}
 	if len(c.pinnedNames) > maxPinnedSkills {
 		return nil, nil, fmt.Errorf("agentloop: %w: %d pinned skill names (at most %d)",
@@ -531,6 +776,16 @@ func resolveSkills(c *config) ([]Skill, []SkillIssue, error) {
 		c.tools = append(c.tools, newSkillReadTool(skills))
 	}
 	return skills, issues, nil
+}
+
+// skillRootCount returns the number of configured scan roots across all
+// sources, for the boot-check error prose.
+func skillRootCount(sources []skillSource) int {
+	n := 0
+	for _, source := range sources {
+		n += len(source.roots)
+	}
+	return n
 }
 
 // joinPromptSection appends a rendered section to the system prompt,
@@ -670,8 +925,9 @@ func skillBodyWithFiles(s *Skill) string {
 }
 
 // skillFooter renders the disclosure appended to a loaded skill body that
-// ships scripts: the absolute base directory and the relative-path
-// semantics, plus a run-don't-read listing of its scripts/ entries.
+// ships scripts: the base directory (absolute for disk roots, fs-relative
+// for embedded packs) and the relative-path semantics, plus a
+// run-don't-read listing of its scripts/ entries.
 // Scripts stay unreadable through skill_read (L3): the listing is metadata
 // for the execution tool, and only the script's output enters context.
 func skillFooter(s *Skill) string {
@@ -685,11 +941,23 @@ func skillFooter(s *Skill) string {
 }
 
 // readSkillFile reads one linked file under the skill's references/ or
-// assets/ tree. The path is jailed: absolute paths, home paths, ".."
-// elements, and symlink escapes are rejected (EvalSymlinks + Rel under
-// the resolved skill directory), and only references/ and assets/ are
-// readable — scripts (L3) run via an execution tool, never through here.
+// assets/ tree. Disk-loaded skills use the OS jail below (EvalSymlinks +
+// Rel); skills loaded from an fs.FS use the lexical jail. Either way,
+// absolute paths, home paths, ".." elements, and paths outside
+// references/ or assets/ are rejected — scripts (L3) run via an execution
+// tool, never through here.
 func readSkillFile(s *Skill, file string) (string, error) {
+	if backend, ok := s.backend.(fsBackend); ok {
+		return readSkillFileFS(s, backend, file)
+	}
+	return readSkillFileOS(s, file)
+}
+
+// readSkillFileOS is the disk jail: absolute paths, home paths, ".."
+// elements, and symlink escapes are rejected (EvalSymlinks + Rel under the
+// resolved skill directory), and only references/ and assets/ are
+// readable.
+func readSkillFileOS(s *Skill, file string) (string, error) {
 	if strings.HasPrefix(file, "~") {
 		return "", errors.New(`skill_read: home paths are not allowed; pass a linked file path under references/ or assets/`)
 	}
@@ -716,6 +984,38 @@ func readSkillFile(s *Skill, file string) (string, error) {
 		return "", fmt.Errorf("skill_read: %s: path escapes the skill directory", file)
 	}
 	data, err := os.ReadFile(real)
+	if err != nil {
+		return "", fmt.Errorf("skill_read: %s: %w", file, err)
+	}
+	return string(data), nil
+}
+
+// readSkillFileFS is the lexical jail for fs.FS sources. The path must be
+// a valid fs path (slash-separated, no leading slash, no "." or ".."
+// elements) under references/ or assets/; an fs.FS has no symlinks, so a
+// separate EvalSymlinks step has nothing to resolve.
+func readSkillFileFS(s *Skill, backend fsBackend, file string) (string, error) {
+	if strings.HasPrefix(file, "~") {
+		return "", errors.New(`skill_read: home paths are not allowed; pass a linked file path under references/ or assets/`)
+	}
+	if strings.HasPrefix(file, "/") {
+		return "", errors.New(`skill_read: absolute paths are not allowed; pass a linked file path under references/ or assets/`)
+	}
+	clean := path.Clean(file)
+	if escapesSlashDir(clean) {
+		return "", errors.New(`skill_read: ".." escapes the skill directory`)
+	}
+	if !fs.ValidPath(clean) {
+		return "", fmt.Errorf("skill_read: %s: not a valid filesystem path", file)
+	}
+	top := clean
+	if i := strings.IndexByte(top, '/'); i >= 0 {
+		top = top[:i]
+	}
+	if top != "references" && top != "assets" {
+		return "", errors.New(`skill_read: only files under references/ or assets/ can be read`)
+	}
+	data, err := backend.readFile(path.Join(s.Dir, clean))
 	if err != nil {
 		return "", fmt.Errorf("skill_read: %s: %w", file, err)
 	}

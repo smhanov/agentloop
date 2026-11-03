@@ -9,9 +9,11 @@ package agentloop_test
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"strings"
@@ -173,6 +175,18 @@ func snippetSkillIssues(llm *llmhub.Client) error {
 		log.Printf("dropped skill %s (%s): %s", issue.Name, issue.Dir, issue.Reason)
 	}
 	return nil
+}
+
+//go:embed testdata/skills
+var readmeSkillsFS embed.FS
+
+// README: Skills (embedded filesystems). The README embeds its own
+// skills/ tree; the mirror re-roots the testdata pack at "skills" so the
+// constructor call matches verbatim.
+func snippetEmbeddedSkills(llm *llmhub.Client) {
+	skillsFS, _ := fs.Sub(readmeSkillsFS, "testdata")
+	ag, err := agentloop.New(llm, agentloop.WithSkillsFS(skillsFS, "skills"))
+	_, _ = ag, err
 }
 
 // README: The search agent (custom backends — proves the interface shapes).

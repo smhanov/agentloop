@@ -38,12 +38,13 @@ type config struct {
 	// run instead, so this field is ignored there.
 	prefix   []*llmhub.Message
 	settings map[string]any
-	// skillDirs, pinnedNames, and requireSkills record construction-time
-	// skill intent (WithSkills / WithPinnedSkills / WithRequireSkills).
-	// resolveSkills consumes them once in New, so the catalog and pinned
-	// bodies are frozen at construction; the fields stay untouched by
-	// per-call option application.
-	skillDirs     []string
+	// skillSources, pinnedNames, and requireSkills record construction-time
+	// skill intent (WithSkills / WithSkillsFS / WithPinnedSkills /
+	// WithRequireSkills). skillSources is ordered: option order is scan and
+	// precedence order. resolveSkills consumes them once in New, so the
+	// catalog and pinned bodies are frozen at construction; the fields stay
+	// untouched by per-call option application.
+	skillSources  []skillSource
 	pinnedNames   []string
 	requireSkills bool
 }

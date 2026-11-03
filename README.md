@@ -296,6 +296,7 @@ per-call options apply after the constructor's, so the later one wins.
 | `WithHooks(h)` | none | Hook callbacks — the extension surface ([Hooks](#hooks)). |
 | `WithCompactor(c)` | none | Installs a `Compactor` that bounds context growth; runs after `RebuildContext` before every call (see [Context compaction](#writing-your-own-agent)). |
 | `WithSkills(dirs ...)` | none | Enables skills from the given skills roots — directories whose immediate children are skill folders: catalog in the prompt + `skill_read` tool. Passing a skill folder itself is reported as a `SkillIssue`, not an error. Construction-time only. |
+| `WithSkillsFS(fsys, roots ...)` | none | The same skill loading from any `io/fs.FS` — `embed.FS`, `os.DirFS`, `fstest.MapFS`, or custom: roots are slash paths relative to the filesystem root. Composes with `WithSkills` in option order; the first occurrence of a name wins. Construction-time only. |
 | `WithPinnedSkills(names ...)` | none | Inlines up to two skill bodies into the system prompt. Construction-time only. |
 | `WithRequireSkills()` | off | Fails construction with `ErrNoSkillsLoaded` when the resolved skill catalog is empty — the boot check for roots that come from the environment. Construction-time only. |
 | `WithToolChoice(c)` | `llmhub.AutoToolChoice()` | Default tool-choice policy; the loop forces `llmhub.NoToolChoice()` itself when the tool budget is spent. |
@@ -676,9 +677,32 @@ extra tool:
   execution tool the agent already has (the bash agent's `bash` tool);
   only their output enters context. A skill that ships `scripts/` gains a
   footer in its `skill_read` body result (and in the pinned-skill
-  rendering) with the skill's absolute base directory, the relative-path
-  semantics, and a run-don't-read listing of its `scripts/` entries;
-  script-less skills render exactly as before.
+  rendering) with the skill's base directory (absolute on disk,
+  filesystem-relative for embedded packs), the relative-path semantics,
+  and a run-don't-read listing of its `scripts/` entries; script-less
+  skills render exactly as before.
+
+**Embedded skills.** A pack can ship inside the binary: `WithSkillsFS`
+accepts any `io/fs.FS` — an `embed.FS`, `os.DirFS`, a `fstest.MapFS`, or
+a custom filesystem — with the same validation, catalog, `skill_read`,
+and pinning behavior as disk roots. `LoadSkillsFS(fsys, roots...)` is the
+standalone loader. Roots are slash paths relative to the filesystem root
+(pass `"skills"`, not `"/skills"`); `Skill.Dir` and the scripts footer
+show that fs-relative path. `io/fs` has no `ReadLink`, so the linked-file
+jail is lexical and symlink-typed entries are skipped — an `os.DirFS`
+tree that uses symlinks behaves differently from the same tree passed to
+`WithSkills`; use `WithSkills` there. Executing embedded `scripts/`
+remains the caller's concern: `skill_read` lists them but never reads
+them, so extract or mount them first. `WithSkills` and `WithSkillsFS`
+compose in option order, and the first occurrence of a name wins across
+both:
+
+```go
+//go:embed skills
+var skillsFS embed.FS
+
+ag, err := agentloop.New(llm, agentloop.WithSkillsFS(skillsFS, "skills"))
+```
 
 **Authoring a skill.** The frontmatter takes `name` (must equal the
 directory name; lowercase letters/digits joined by single hyphens, 1–64
@@ -704,7 +728,8 @@ system prompt at construction (at most two; more fails with
 **Loading is fail-closed.** A folder that fails validation (bad
 frontmatter, name/directory mismatch, oversized description, empty body)
 is omitted and reported as a `SkillIssue` by `agentloop.LoadSkills(dirs...)`
-— never an error, never a crash (only an unreadable scan root fails
+or `agentloop.LoadSkillsFS(fsys, roots...)` — never an error, never a crash
+(only an unreadable scan root fails
 construction). The same goes for a shape mistake: passing a skill folder
 itself — a directory containing `SKILL.md` — where a skills root is
 expected loads nothing, scans no children, and yields exactly one
@@ -739,9 +764,9 @@ for _, issue := range ag.SkillIssues() {
 }
 ```
 
-Both presets forward `WithSkills` to the core unchanged, so the same
-issues — and the same catalog — are reachable through their wrapped
-agent's `SkillIssues()` and `Skills()`.
+Both presets forward `WithSkills` and `WithSkillsFS` to the core
+unchanged, so the same issues — and the same catalog — are reachable
+through their wrapped agent's `SkillIssues()` and `Skills()`.
 
 **Checking the loaded catalog at boot.** `Agent.Skills()` returns the
 construction-resolved catalog itself — the skills the prompt advertises
@@ -847,7 +872,7 @@ the unmodified agentloop core; the default templates are domain-neutral,
 so the preset frames any task — gather information, verify it, report —
 and specialized missions (coding included) are one template override away
 (see [Specializing the bash agent](#specializing-the-bash-agent)). Built
-with [`WithSkills`](#skills), loaded scripts run through its `bash` tool
+with [`WithSkills`/`WithSkillsFS`](#skills), loaded scripts run through its `bash` tool
 (L3): the `skill_read` result discloses the skill's base directory and
 `scripts/` entries, and only the script's output enters context.
 
