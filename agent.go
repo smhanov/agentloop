@@ -17,6 +17,10 @@ import (
 type Agent struct {
 	llm *llmhub.Client
 	cfg config
+	// skills is the catalog resolveSkills loaded at construction, frozen
+	// here (not on cfg) so per-call options can never mutate it. See
+	// Skills.
+	skills []Skill
 	// skillIssues is what resolveSkills recorded at construction, frozen
 	// here (not on cfg) so per-call options can never mutate it. See
 	// SkillIssues.
@@ -38,11 +42,11 @@ func New(llm *llmhub.Client, opts ...Option) (*Agent, error) {
 		toolChoice:     llmhub.AutoToolChoice(),
 	}
 	applyOptions(&cfg, opts)
-	skillIssues, err := resolveSkills(&cfg)
+	skills, skillIssues, err := resolveSkills(&cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{llm: llm, cfg: cfg, skillIssues: skillIssues}, nil
+	return &Agent{llm: llm, cfg: cfg, skills: skills, skillIssues: skillIssues}, nil
 }
 
 // MustNew is like New but panics on error (for examples and tests).
@@ -62,6 +66,25 @@ func MustNew(llm *llmhub.Client, opts ...Option) *Agent {
 func (a *Agent) Tools() []Tool {
 	out := make([]Tool, len(a.cfg.tools))
 	copy(out, a.cfg.tools)
+	return out
+}
+
+// Skills returns the skills resolved at construction, in scan order: the
+// roots in the order they were given to WithSkills, and each root's
+// children sorted by folder name. The result is a snapshot copy; mutating
+// the slice affects no Agent. The Skill values themselves are frozen at
+// construction, so treat their fields (Body, LinkedFiles, ScriptFiles) as
+// read-only. It is nil when no skills were configured or none loaded — so
+// len(ag.Skills()) == 0 is the one-glance skillless signal. WithRequireSkills
+// turns that condition into a construction error. Both presets forward
+// WithSkills to New unchanged, so the same catalog is reachable through
+// their wrapped core Agent.
+func (a *Agent) Skills() []Skill {
+	if len(a.skills) == 0 {
+		return nil
+	}
+	out := make([]Skill, len(a.skills))
+	copy(out, a.skills)
 	return out
 }
 

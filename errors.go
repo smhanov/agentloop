@@ -26,4 +26,7 @@ var (
 	// than two skills; at most two bodies may be inlined into the system
 	// prompt.
 	ErrTooManyPinnedSkills = errors.New("agentloop: too many pinned skills")
+	// ErrNoSkillsLoaded reports that a WithRequireSkills construction
+	// resolved an empty skill catalog.
+	ErrNoSkillsLoaded = errors.New("agentloop: no skills loaded")
 )

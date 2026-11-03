@@ -52,3 +52,18 @@ func TestSkillIssuesPassThrough(t *testing.T) {
 		t.Fatalf("issue = %+v, want the root-shape issue for misplaced", issues[0])
 	}
 }
+
+// TestSkillsPassThrough pins that the preset forwards the core Skills
+// accessor unchanged: the construction-resolved catalog is reachable
+// through the wrapped core agent exactly as on a directly built one.
+func TestSkillsPassThrough(t *testing.T) {
+	root := skillTree(t, map[string]string{
+		"alpha/SKILL.md": skillMD("alpha", "Use when alpha.", "Alpha body."),
+	})
+	agent := newFakeAgent(t, agentloop.WithSkills(root))
+
+	skills := agent.Agent().Skills()
+	if len(skills) != 1 || skills[0].Name != "alpha" || skills[0].Body != "Alpha body." {
+		t.Fatalf("Skills() = %+v, want the loaded alpha skill", skills)
+	}
+}

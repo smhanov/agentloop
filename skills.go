@@ -465,22 +465,42 @@ func WithPinnedSkills(names ...string) Option {
 	return func(c *config) { c.pinnedNames = append(c.pinnedNames, names...) }
 }
 
+// WithRequireSkills makes construction fail when the resolved skill
+// catalog is empty: New returns an error wrapping ErrNoSkillsLoaded when
+// WithSkills and WithPinnedSkills together load zero skills — no roots
+// configured at all, roots that exist but contain no valid skill folder,
+// or roots whose skills all failed validation. It is the boot-time check
+// for a consumer that expects skills, for example when the roots come
+// from an environment variable that may be unset; without it an empty
+// catalog is legal and the agent runs skillless.
+//
+// This is a construction-time option: New resolves skills once, so
+// passing it to Ask or AskStream has no effect. Agent.Skills reports the
+// loaded catalog whether or not the requirement is set.
+func WithRequireSkills() Option {
+	return func(c *config) { c.requireSkills = true }
+}
+
 // resolveSkills performs the construction-time skill wiring: loading,
 // catalog and pinned-body rendering, and skill_read registration. It
-// returns the issues LoadSkills recorded, for observability through
-// Agent.SkillIssues. New calls it once, after all options have applied, so
-// option order never matters and the rendered prompt is frozen for the
-// Agent's lifetime.
-func resolveSkills(c *config) ([]SkillIssue, error) {
-	if len(c.skillDirs) == 0 && len(c.pinnedNames) == 0 {
-		return nil, nil
+// returns the loaded skills and the issues LoadSkills recorded, for
+// observability through Agent.Skills and Agent.SkillIssues. New calls it
+// once, after all options have applied, so option order never matters and
+// the rendered prompt is frozen for the Agent's lifetime.
+func resolveSkills(c *config) ([]Skill, []SkillIssue, error) {
+	if len(c.skillDirs) == 0 && len(c.pinnedNames) == 0 && !c.requireSkills {
+		return nil, nil, nil
 	}
 	skills, issues, err := LoadSkills(c.skillDirs...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if c.requireSkills && len(skills) == 0 {
+		return nil, nil, fmt.Errorf("%w: %d configured root(s) yielded no valid skills",
+			ErrNoSkillsLoaded, len(c.skillDirs))
 	}
 	if len(c.pinnedNames) > maxPinnedSkills {
-		return nil, fmt.Errorf("agentloop: %w: %d pinned skill names (at most %d)",
+		return nil, nil, fmt.Errorf("agentloop: %w: %d pinned skill names (at most %d)",
 			ErrTooManyPinnedSkills, len(c.pinnedNames), maxPinnedSkills)
 	}
 	byName := make(map[string]*Skill, len(skills))
@@ -495,7 +515,7 @@ func resolveSkills(c *config) ([]SkillIssue, error) {
 		}
 		skill, ok := byName[name]
 		if !ok {
-			return nil, fmt.Errorf("agentloop: %w: pinned skill %q is not among the loaded skills",
+			return nil, nil, fmt.Errorf("agentloop: %w: pinned skill %q is not among the loaded skills",
 				ErrInvalidInput, name)
 		}
 		pinnedSeen[name] = true
@@ -510,7 +530,7 @@ func resolveSkills(c *config) ([]SkillIssue, error) {
 	if len(skills) > 0 {
 		c.tools = append(c.tools, newSkillReadTool(skills))
 	}
-	return issues, nil
+	return skills, issues, nil
 }
 
 // joinPromptSection appends a rendered section to the system prompt,

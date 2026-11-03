@@ -1191,6 +1191,129 @@ func TestAgentSkillIssues(t *testing.T) {
 	})
 }
 
+// TestRequireSkillsFailsOnEmptyCatalog pins the boot check: with
+// WithRequireSkills a construction whose resolved catalog is empty fails
+// with the sentinel, whether no root was configured, a root is missing, a
+// root exists but holds no skill folder, or every skill folder failed
+// validation.
+func TestRequireSkillsFailsOnEmptyCatalog(t *testing.T) {
+	emptyRoot := t.TempDir()
+	missingRoot := filepath.Join(t.TempDir(), "absent")
+	invalidRoot := skillTree(t, map[string]string{
+		"broken/SKILL.md": "just markdown, no frontmatter\n",
+	})
+
+	cases := []struct {
+		label string
+		opts  []Option
+	}{
+		{label: "no roots configured"},
+		{label: "missing root", opts: []Option{WithSkills(missingRoot)}},
+		{label: "existing but empty root", opts: []Option{WithSkills(emptyRoot)}},
+		{label: "all skills invalid", opts: []Option{WithSkills(invalidRoot)}},
+	}
+	client, err := llmhub.New("fake", "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			opts := append([]Option{WithRequireSkills()}, tc.opts...)
+			if _, err := New(client, opts...); !errors.Is(err, ErrNoSkillsLoaded) {
+				t.Fatalf("New err = %v, want ErrNoSkillsLoaded", err)
+			}
+		})
+	}
+}
+
+func TestRequireSkillsPassesWithSkills(t *testing.T) {
+	first := skillTree(t, map[string]string{
+		"beta/SKILL.md":  skillMD("beta", "Use when beta.", "Beta body."),
+		"alpha/SKILL.md": skillMD("alpha", "Use when alpha.", "Alpha body."),
+	})
+	second := skillTree(t, map[string]string{
+		"gamma/SKILL.md": skillMD("gamma", "Use when gamma.", "Gamma body."),
+	})
+
+	agent := newFakeAgent(t, WithRequireSkills(), WithSkills(first, second))
+	skills := agent.Skills()
+	names := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		names = append(names, skill.Name)
+	}
+	if got, want := strings.Join(names, ","), "alpha,beta,gamma"; got != want {
+		t.Fatalf("Skills() names = %q, want scan order %q", got, want)
+	}
+	if skills[0].Body != "Alpha body." {
+		t.Fatalf("Skills()[0].Body = %q, want the loaded body", skills[0].Body)
+	}
+}
+
+func TestSkillsAccessor(t *testing.T) {
+	t.Run("nil when no skills configured", func(t *testing.T) {
+		agent := newFakeAgent(t)
+		if got := agent.Skills(); got != nil {
+			t.Fatalf("Skills() = %+v, want nil without WithSkills", got)
+		}
+	})
+
+	t.Run("nil when an empty root loads nothing", func(t *testing.T) {
+		agent := newFakeAgent(t, WithSkills(t.TempDir()))
+		if got := agent.Skills(); got != nil {
+			t.Fatalf("Skills() = %+v, want nil for an empty catalog", got)
+		}
+	})
+
+	t.Run("returned slice is a snapshot", func(t *testing.T) {
+		root := skillTree(t, map[string]string{
+			"alpha/SKILL.md": skillMD("alpha", "Use when alpha.", "Alpha body."),
+		})
+		agent := newFakeAgent(t, WithSkills(root))
+		snapshot := agent.Skills()
+		snapshot[0].Name = "tampered"
+		snapshot[0].Body = "tampered"
+		fresh := agent.Skills()
+		if len(fresh) != 1 || fresh[0].Name != "alpha" || fresh[0].Body != "Alpha body." {
+			t.Fatalf("mutating the snapshot changed the Agent's catalog: %+v", fresh)
+		}
+	})
+}
+
+// TestRequireSkillsPerCallNoop pins that a per-call WithRequireSkills does
+// nothing: resolution happens once in New, so a skillless agent runs
+// exactly as without the option.
+func TestRequireSkillsPerCallNoop(t *testing.T) {
+	agent := newFakeAgent(t)
+	resetScript(t, textTurn("done"))
+	ans, err := agent.Ask(context.Background(), "go", WithRequireSkills())
+	if err != nil {
+		t.Fatalf("per-call WithRequireSkills changed the run: %v", err)
+	}
+	if ans.Text != "done" {
+		t.Fatalf("answer text = %q", ans.Text)
+	}
+	if got := agent.Skills(); got != nil {
+		t.Fatalf("Skills() = %+v, want nil", got)
+	}
+}
+
+// TestSkilllessDefaultIsLegal pins the unchanged default: without
+// WithRequireSkills an empty catalog constructs and completes a run.
+func TestSkilllessDefaultIsLegal(t *testing.T) {
+	agent := newFakeAgent(t)
+	if got := agent.Skills(); got != nil {
+		t.Fatalf("Skills() = %+v, want nil", got)
+	}
+	resetScript(t, textTurn("skillless answer"))
+	ans, err := agent.Ask(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("skillless Ask: %v", err)
+	}
+	if ans.Text != "skillless answer" {
+		t.Fatalf("answer text = %q", ans.Text)
+	}
+}
+
 // roleNames renders roles for easy comparison.
 func roleNames(roles []llmhub.Role) []string {
 	names := make([]string, 0, len(roles))

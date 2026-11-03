@@ -297,6 +297,7 @@ per-call options apply after the constructor's, so the later one wins.
 | `WithCompactor(c)` | none | Installs a `Compactor` that bounds context growth; runs after `RebuildContext` before every call (see [Context compaction](#writing-your-own-agent)). |
 | `WithSkills(dirs ...)` | none | Enables skills from the given skills roots — directories whose immediate children are skill folders: catalog in the prompt + `skill_read` tool. Passing a skill folder itself is reported as a `SkillIssue`, not an error. Construction-time only. |
 | `WithPinnedSkills(names ...)` | none | Inlines up to two skill bodies into the system prompt. Construction-time only. |
+| `WithRequireSkills()` | off | Fails construction with `ErrNoSkillsLoaded` when the resolved skill catalog is empty — the boot check for roots that come from the environment. Construction-time only. |
 | `WithToolChoice(c)` | `llmhub.AutoToolChoice()` | Default tool-choice policy; the loop forces `llmhub.NoToolChoice()` itself when the tool budget is spent. |
 | `WithGenerateOptions(opts ...)` | none | llmhub options forwarded to every LLM call (temperature, cache key, …). Repeated uses append. |
 | `WithSetting(k, v)` / `Settings(opts...)` | — | Preset-author channel: attach named values to an option list and read them back; the core itself ignores settings. |
@@ -739,7 +740,22 @@ for _, issue := range ag.SkillIssues() {
 ```
 
 Both presets forward `WithSkills` to the core unchanged, so the same
-issues are reachable through their wrapped agent's `SkillIssues()`.
+issues — and the same catalog — are reachable through their wrapped
+agent's `SkillIssues()` and `Skills()`.
+
+**Checking the loaded catalog at boot.** `Agent.Skills()` returns the
+construction-resolved catalog itself — the skills the prompt advertises
+and `skill_read` serves — in scan order (roots in the order given, each
+root's folders sorted by name) as a snapshot copy. It is nil when no
+skills were configured or none loaded, so `len(ag.Skills()) == 0` is the
+one-glance skillless signal. When an empty catalog should abort startup —
+the classic case is a root path read from an environment variable that
+was never set — add `agentloop.WithRequireSkills()`: `New` then fails with
+an error wrapping `ErrNoSkillsLoaded` instead of silently running without
+skills. Without the flag an empty catalog keeps constructing and running
+exactly as before; the library cannot guess whether skills were intended,
+so the default stays legal. The flag is construction-time only, like
+`WithSkills`, and per-call use has no effect.
 
 Skill loads are ordinary tool calls: they appear in `Answer.Tools`, in
 traces, and in `AfterToolCall` hooks like any other execution.

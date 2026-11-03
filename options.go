@@ -38,12 +38,14 @@ type config struct {
 	// run instead, so this field is ignored there.
 	prefix   []*llmhub.Message
 	settings map[string]any
-	// skillDirs and pinnedNames record construction-time skill intent
-	// (WithSkills / WithPinnedSkills). resolveSkills consumes them once in
-	// New, so the catalog and pinned bodies are frozen at construction;
-	// the fields stay untouched by per-call option application.
-	skillDirs   []string
-	pinnedNames []string
+	// skillDirs, pinnedNames, and requireSkills record construction-time
+	// skill intent (WithSkills / WithPinnedSkills / WithRequireSkills).
+	// resolveSkills consumes them once in New, so the catalog and pinned
+	// bodies are frozen at construction; the fields stay untouched by
+	// per-call option application.
+	skillDirs     []string
+	pinnedNames   []string
+	requireSkills bool
 }
 
 // effectiveMaxToolCalls returns the tool-execution budget for a run.
