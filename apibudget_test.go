@@ -47,7 +47,13 @@ var budgetedPackages = map[string]string{
 // ceiling of 216 for the two-symbol fs.FS skills surface: LoadSkillsFS and
 // WithSkillsFS make "ship the skill pack inside the binary" a first-class
 // loading mode alongside disk roots, rather than an incidental helper.
-const exportedAPICeiling = 218
+//
+// 221 (measured: agentloop 137, search 51, bash 33) raises the previous
+// ceiling of 218 for the three-symbol after-batch seam:
+// Hooks.AfterToolBatch, EventAfterToolBatch, and Event.Results make "react
+// to a step's whole tool batch, exactly once" a first-class extension
+// point alongside the per-call BeforeToolCall/AfterToolCall pair.
+const exportedAPICeiling = 221
 
 // countExportedSymbols parses the package in dir (non-test files only)
 // and returns its exported-symbol count per the rule above.
