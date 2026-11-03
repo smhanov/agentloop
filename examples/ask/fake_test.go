@@ -18,6 +18,7 @@ type fakeTurn struct {
 	reasoning string
 	calls     []*llmhub.ToolCallContent
 	usage     *llmhub.UsageMetadata
+	upstream  *llmhub.UpstreamInfo
 	err       error
 }
 
@@ -67,6 +68,7 @@ func (fakeProvider) Generate(ctx context.Context, prompt []*llmhub.Message, opts
 	if turn.usage != nil {
 		resp.Usage = *turn.usage
 	}
+	resp.Upstream = turn.upstream
 	return resp, nil
 }
 
@@ -91,9 +93,10 @@ func (fakeProvider) Stream(ctx context.Context, prompt []*llmhub.Message, opts .
 			ch <- llmhub.StreamChunk{ToolCalls: []*llmhub.ToolCallContent{call}}
 		}
 		ch <- llmhub.StreamChunk{
-			Done:   true,
-			Usage:  turn.usage,
-			Timing: &llmhub.TimingMetrics{FirstToken: time.Millisecond, Total: 2 * time.Millisecond, Chunks: 3},
+			Done:     true,
+			Usage:    turn.usage,
+			Upstream: turn.upstream,
+			Timing:   &llmhub.TimingMetrics{FirstToken: time.Millisecond, Total: 2 * time.Millisecond, Chunks: 3},
 		}
 	}()
 	return ch, nil

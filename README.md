@@ -373,10 +373,10 @@ call; copy anything you retain.
 | `OnStart` | when a run begins | — | `Query`, `Messages` |
 | `BeforeGenerate` | before each LLM call | **Append** to `Messages` (appends become permanent transcript entries — the steering seam); set `Skip` for a graceful stop | `Step`, `Messages`, `Skip` |
 | `RebuildContext` | after `BeforeGenerate`, before the call | Observe or **replace** `Context` — the exact message list the model is about to see (see [recipes](#writing-your-own-agent)) | `Step`, `Messages` (read-only transcript), `Context` |
-| `AfterGenerate` | after each LLM response | **Append** to `Messages`; flip `Finish` (the finish veto) | `Step`, `Messages`, `Response`, `Finish` |
+| `AfterGenerate` | after each LLM response | **Append** to `Messages`; flip `Finish` (the finish veto) | `Step`, `Messages`, `Response`, `Finish`, `FinishReason` |
 | `BeforeToolCall` | before each tool call | Rewrite `Args`; return `ErrSkipToolCall` to veto; **may block** (approval gates) | `Step`, `Call`, `Args` |
 | `AfterToolCall` | when a tool execution completes | — (fires in completion order) | `Step`, `Call`, `Args`, `Result`, `Err`, `Duration` |
-| `OnDelta` | streaming answer/reasoning deltas | — | `Kind`, `Step`, `Delta`, `Timing` |
+| `OnDelta` | streaming answer/reasoning deltas | — | `Kind`, `Step`, `Delta`, `Timing`, `ID`, `Upstream`, `ReasoningDetails`, `FinishReason` |
 | `OnDone` | once, when the run finishes | — | `Answer` (fully populated), `Timing` |
 | `OnError` | once, on terminal failure | — | `Err` (also returned from `Ask`), `Answer` |
 
@@ -425,6 +425,10 @@ populated depends on `Kind` (`EventStart`, `EventBeforeGenerate`,
 | `Duration` | the tool execution's wall time (`AfterToolCall`) |
 | `Delta` | incremental streamed text (`OnDelta`) |
 | `Timing` | llmhub latency telemetry snapshot (delta events; `EventDone` carries the complete set) |
+| `ID` | upstream completion id of the producing chunk (delta events); `AfterGenerate` exposes the step's id via `Response.ID` |
+| `Upstream` | which HTTP upstream answered (status, headers, vendor provider/model), from the producing chunk (delta events); `AfterGenerate` exposes the step's upstream via `Response.Upstream` |
+| `ReasoningDetails` | structured reasoning (summaries, signed text, encrypted blocks) from the producing chunk (delta events; append across deltas for the full set); `AfterGenerate` exposes the accumulated set via `Response.ReasoningDetails` |
+| `FinishReason` | how the stream ended (`stop`, `length`, `tool_calls`): on `AfterGenerate` in streaming mode, or on a delta event whose chunk reported it; empty in ask mode |
 | `Answer` | the fully populated result (`EventDone`, partial on `EventError`) |
 
 ## Budgets and loop safety
@@ -520,6 +524,19 @@ for ev := range events {
   provider-side stamps never reach consumers, only client-measured
   values do. `Answer.Timing` is nil only when the provider bypassed
   llmhub's `Client`.
+- **Chunk metadata.** Delta events also carry the producing chunk's
+  `ID`, `Upstream` (which HTTP upstream answered — status, headers, and
+  vendor-reported provider/model), and `ReasoningDetails` (structured
+  reasoning summaries, signed text, and encrypted blocks). Details are
+  per-chunk, matching llmhub: each event holds only its own chunk's
+  slice, so append across events for the full set. A delta event also
+  carries `FinishReason` when its chunk reported one (typically the
+  final content frame). The step's `AfterGenerate` event carries the
+  same `Response.ID`, `Response.Upstream`, and
+  `Response.ReasoningDetails` that `Ask` sees, plus `FinishReason` in
+  streaming mode — including for tool-call-only steps that emit no
+  delta events. `FinishReason` is empty in ask mode, which has no
+  finish reason; `Response` itself has no such field.
 
 The same `Hooks` work in streaming mode (`OnDelta` observes every delta
 in stream order in addition to the channel). `AskStream` is implemented

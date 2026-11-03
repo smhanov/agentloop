@@ -48,11 +48,15 @@ func (r *run) streamInfer(ctx context.Context, llm *llmhub.Client, context []*ll
 	}
 
 	var (
-		text      strings.Builder
-		reasoning strings.Builder
-		calls     []*llmhub.ToolCallContent
-		usage     llmhub.UsageMetadata
-		timing    *llmhub.TimingMetrics
+		text             strings.Builder
+		reasoning        strings.Builder
+		calls            []*llmhub.ToolCallContent
+		usage            llmhub.UsageMetadata
+		timing           *llmhub.TimingMetrics
+		id               string
+		upstream         *llmhub.UpstreamInfo
+		reasoningDetails []llmhub.ReasoningDetail
+		finishReason     string
 	)
 	step := r.steps + 1
 	// abandon drains the rest of the stream in the background so the
@@ -63,9 +67,32 @@ func (r *run) streamInfer(ctx context.Context, llm *llmhub.Client, context []*ll
 			abandon()
 			return nil, chunk.Err
 		}
+		if id == "" && chunk.ID != "" {
+			id = chunk.ID
+		}
+		if chunk.Upstream != nil {
+			// Copy so the run never aliases provider internals.
+			u := *chunk.Upstream
+			upstream = &u
+		}
+		if len(chunk.ReasoningDetails) > 0 {
+			reasoningDetails = append(reasoningDetails, chunk.ReasoningDetails...)
+		}
+		if chunk.FinishReason != "" {
+			finishReason = chunk.FinishReason
+		}
 		if chunk.ReasoningDelta != "" {
 			reasoning.WriteString(chunk.ReasoningDelta)
-			ev := &Event{Kind: EventReasoningDelta, Step: step, Delta: chunk.ReasoningDelta, Timing: chunk.Timing}
+			ev := &Event{
+				Kind:             EventReasoningDelta,
+				Step:             step,
+				Delta:            chunk.ReasoningDelta,
+				Timing:           chunk.Timing,
+				ID:               chunk.ID,
+				Upstream:         chunk.Upstream,
+				ReasoningDetails: chunk.ReasoningDetails,
+				FinishReason:     chunk.FinishReason,
+			}
 			if err := fire(ctx, r.cfg.hooks.OnDelta, ev); err != nil {
 				abandon()
 				return nil, fmt.Errorf("agentloop: OnDelta hook: %w", err)
@@ -74,7 +101,16 @@ func (r *run) streamInfer(ctx context.Context, llm *llmhub.Client, context []*ll
 		}
 		if chunk.Delta != "" {
 			text.WriteString(chunk.Delta)
-			ev := &Event{Kind: EventAnswerDelta, Step: step, Delta: chunk.Delta, Timing: chunk.Timing}
+			ev := &Event{
+				Kind:             EventAnswerDelta,
+				Step:             step,
+				Delta:            chunk.Delta,
+				Timing:           chunk.Timing,
+				ID:               chunk.ID,
+				Upstream:         chunk.Upstream,
+				ReasoningDetails: chunk.ReasoningDetails,
+				FinishReason:     chunk.FinishReason,
+			}
 			if err := fire(ctx, r.cfg.hooks.OnDelta, ev); err != nil {
 				abandon()
 				return nil, fmt.Errorf("agentloop: OnDelta hook: %w", err)
@@ -94,6 +130,7 @@ func (r *run) streamInfer(ctx context.Context, llm *llmhub.Client, context []*ll
 			break
 		}
 	}
+	r.lastFinishReason = finishReason
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -108,7 +145,14 @@ func (r *run) streamInfer(ctx context.Context, llm *llmhub.Client, context []*ll
 	for _, call := range calls {
 		content = append(content, call)
 	}
-	return &llmhub.Response{Content: content, Usage: usage, Timing: timing}, nil
+	return &llmhub.Response{
+		ID:               id,
+		Content:          content,
+		Usage:            usage,
+		ReasoningDetails: reasoningDetails,
+		Timing:           timing,
+		Upstream:         upstream,
+	}, nil
 }
 
 // watchStream forwards stream chunks, aborting with ErrStreamStale when no

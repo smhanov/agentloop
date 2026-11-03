@@ -54,13 +54,16 @@ type run struct {
 	timing     *llmhub.TimingMetrics
 	reasoning  strings.Builder
 	lastText   string // the most recent step's assistant text
-	trace      []ToolResult
-	dupKey     string // (name, args) key of the current consecutive run
-	dupCount   int    // length of the current consecutive identical-call run
-	dupOutput  string // observation of the latest call in that run
-	dupNudged  bool   // the run has warned; the next identical call stops
-	notice     bool   // the forced-final notice is already in the transcript
-	compactor  Compactor
+	// lastFinishReason is the most recent streamed step's finish reason;
+	// empty in ask mode, which has no finish reason.
+	lastFinishReason string
+	trace            []ToolResult
+	dupKey           string // (name, args) key of the current consecutive run
+	dupCount         int    // length of the current consecutive identical-call run
+	dupOutput        string // observation of the latest call in that run
+	dupNudged        bool   // the run has warned; the next identical call stops
+	notice           bool   // the forced-final notice is already in the transcript
+	compactor        Compactor
 }
 
 // newRun initializes per-run state from a resolved config.
@@ -207,12 +210,26 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 		// done); the hook may flip it either way — false continues the
 		// loop with whatever the hook appended, true stops without
 		// executing the tools.
-		ev = &Event{Kind: EventAfterGenerate, Step: r.steps, Messages: r.transcript, Response: resp, Finish: len(resp.ToolCalls()) == 0}
+		ev = &Event{
+			Kind:         EventAfterGenerate,
+			Step:         r.steps,
+			Messages:     r.transcript,
+			Response:     resp,
+			Finish:       len(resp.ToolCalls()) == 0,
+			FinishReason: r.lastFinishReason,
+		}
 		if err := fire(ctx, hooks.AfterGenerate, ev); err != nil {
 			return r.fail(fmt.Errorf("agentloop: AfterGenerate hook: %w", err))
 		}
 		r.transcript = ev.Messages
-		r.emit(&Event{Kind: EventAfterGenerate, Step: r.steps, Messages: r.transcript, Response: resp, Finish: ev.Finish})
+		r.emit(&Event{
+			Kind:         EventAfterGenerate,
+			Step:         r.steps,
+			Messages:     r.transcript,
+			Response:     resp,
+			Finish:       ev.Finish,
+			FinishReason: r.lastFinishReason,
+		})
 
 		if ev.Finish {
 			return r.finish(StatusCompleted)

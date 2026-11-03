@@ -281,6 +281,23 @@ func TestStreamSplitsReasoningFromAnswer(t *testing.T) {
 	}
 }
 
+// The -v stream trace names the provider that actually served the final
+// step when the upstream reports its identity.
+func TestVerboseTraceUpstreamIdentity(t *testing.T) {
+	resetFake(t, fakeTurn{
+		text:     "hi",
+		upstream: &llmhub.UpstreamInfo{Provider: "zai", Model: "glm-5"},
+	})
+	args := []string{"-provider", "fake", "-agent", "plain", "-stream", "-v", "-prompt", "hi"}
+	code, _, stderr := runCLI(t, args, "")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "provider=zai model=glm-5") {
+		t.Errorf("stderr = %q, want the final step's upstream identity", stderr)
+	}
+}
+
 // AC5: -prompt-file reads the prompt from disk.
 func TestPromptFile(t *testing.T) {
 	resetFake(t, textTurn("ok"))

@@ -204,6 +204,186 @@ func TestAskStreamWatchdogDisabledCtxCancel(t *testing.T) {
 	}
 }
 
+func TestStreamChunkMetadataOnDeltaEvents(t *testing.T) {
+	upstreamA := &llmhub.UpstreamInfo{StatusCode: 200, Provider: "alpha", Model: "alpha-1"}
+	upstreamB := &llmhub.UpstreamInfo{StatusCode: 200, Provider: "beta", Model: "beta-2"}
+	detailsA := []llmhub.ReasoningDetail{{Type: "reasoning.summary", Text: "first"}}
+	detailsB := []llmhub.ReasoningDetail{{Type: "reasoning.text", Text: "second", Signature: "sig"}}
+	resetScript(t, streamTurn(
+		fakeChunk{reasoning: "ponder", id: "stream-1", upstream: upstreamA, reasoningDetails: detailsA},
+		fakeChunk{delta: "answer", id: "stream-1", upstream: upstreamB, reasoningDetails: detailsB, finishReason: "stop"},
+		fakeChunk{id: "stream-1", upstream: upstreamB, done: true},
+	))
+	var hookEvents []Event
+	ag := newFakeAgent(t, WithHooks(Hooks{
+		OnDelta: func(ctx context.Context, ev *Event) error {
+			hookEvents = append(hookEvents, *ev)
+			return nil
+		},
+	}))
+
+	events, err := ag.AskStream(context.Background(), "Hi")
+	if err != nil {
+		t.Fatalf("AskStream: %v", err)
+	}
+	evs := collectEvents(t, events)
+
+	var deltaEvents []Event
+	for _, ev := range evs {
+		if ev.Kind == EventReasoningDelta || ev.Kind == EventAnswerDelta {
+			deltaEvents = append(deltaEvents, ev)
+		}
+	}
+	want := []struct {
+		kind     EventKind
+		id       string
+		upstream *llmhub.UpstreamInfo
+		details  []llmhub.ReasoningDetail
+		finish   string
+	}{
+		{EventReasoningDelta, "stream-1", upstreamA, detailsA, ""},
+		{EventAnswerDelta, "stream-1", upstreamB, detailsB, "stop"},
+	}
+	if len(deltaEvents) != len(want) {
+		t.Fatalf("delta events = %+v, want %d", deltaEvents, len(want))
+	}
+	for i, w := range want {
+		got := deltaEvents[i]
+		if got.Kind != w.kind {
+			t.Errorf("delta %d kind = %v, want %v", i, got.Kind, w.kind)
+		}
+		if got.ID != w.id {
+			t.Errorf("delta %d ID = %q, want %q", i, got.ID, w.id)
+		}
+		if !reflect.DeepEqual(got.Upstream, w.upstream) {
+			t.Errorf("delta %d Upstream = %+v, want %+v", i, got.Upstream, w.upstream)
+		}
+		if !reflect.DeepEqual(got.ReasoningDetails, w.details) {
+			t.Errorf("delta %d ReasoningDetails = %+v, want %+v", i, got.ReasoningDetails, w.details)
+		}
+		if got.FinishReason != w.finish {
+			t.Errorf("delta %d FinishReason = %q, want %q", i, got.FinishReason, w.finish)
+		}
+	}
+	// OnDelta observes the same values as the channel events.
+	if len(hookEvents) != len(deltaEvents) {
+		t.Fatalf("OnDelta events = %d, want %d", len(hookEvents), len(deltaEvents))
+	}
+	for i := range hookEvents {
+		if !reflect.DeepEqual(hookEvents[i], deltaEvents[i]) {
+			t.Errorf("OnDelta event %d = %+v, channel event = %+v", i, hookEvents[i], deltaEvents[i])
+		}
+	}
+}
+
+func TestStreamAfterGenerateMetadataParity(t *testing.T) {
+	upstream := &llmhub.UpstreamInfo{StatusCode: 200, Provider: "router", Model: "concrete", SystemFingerprint: "fp"}
+	details := []llmhub.ReasoningDetail{{Type: "reasoning.summary", Text: "plan"}}
+	script := func() []fakeTurn {
+		return []fakeTurn{
+			// Tool-call-only step: no text or reasoning deltas, so the
+			// metadata reaches consumers through AfterGenerate.
+			{calls: []*llmhub.ToolCallContent{llmhub.ToolCall("c1", "clock", `{}`)}, reasoningDetails: details, upstream: upstream},
+			{text: "noon", reasoningDetails: details, upstream: upstream},
+		}
+	}
+	capture := func(t *testing.T, ask bool) ([]Event, []Event) {
+		t.Helper()
+		resetScript(t, script()...)
+		var generated []Event
+		ag := newFakeAgent(t, WithTools(clockTool()), WithHooks(Hooks{
+			AfterGenerate: func(ctx context.Context, ev *Event) error {
+				generated = append(generated, *ev)
+				return nil
+			},
+		}))
+		var deltas []Event
+		if ask {
+			if _, err := ag.Ask(context.Background(), "What time is it?"); err != nil {
+				t.Fatalf("Ask: %v", err)
+			}
+		} else {
+			events, err := ag.AskStream(context.Background(), "What time is it?")
+			if err != nil {
+				t.Fatalf("AskStream: %v", err)
+			}
+			for _, ev := range collectEvents(t, events) {
+				if ev.Kind == EventReasoningDelta || ev.Kind == EventAnswerDelta {
+					deltas = append(deltas, ev)
+				}
+			}
+		}
+		return generated, deltas
+	}
+
+	askEvents, _ := capture(t, true)
+	streamEvents, streamDeltas := capture(t, false)
+	if len(askEvents) != 2 || len(streamEvents) != 2 {
+		t.Fatalf("AfterGenerate events = %d ask, %d stream, want 2 each", len(askEvents), len(streamEvents))
+	}
+	for i := range askEvents {
+		askResp, streamResp := askEvents[i].Response, streamEvents[i].Response
+		if askResp == nil || streamResp == nil {
+			t.Fatalf("step %d response = %+v ask, %+v stream", i+1, askResp, streamResp)
+		}
+		if askResp.ID == "" || askResp.ID != streamResp.ID {
+			t.Errorf("step %d ID = %q ask, %q stream, want equal and non-empty", i+1, askResp.ID, streamResp.ID)
+		}
+		if !reflect.DeepEqual(askResp.Upstream, streamResp.Upstream) {
+			t.Errorf("step %d Upstream = %+v ask, %+v stream", i+1, askResp.Upstream, streamResp.Upstream)
+		}
+		if !reflect.DeepEqual(askResp.ReasoningDetails, streamResp.ReasoningDetails) {
+			t.Errorf("step %d ReasoningDetails = %+v ask, %+v stream", i+1, askResp.ReasoningDetails, streamResp.ReasoningDetails)
+		}
+		if streamResp.Upstream == nil || streamResp.Upstream.Provider != "router" || streamResp.Upstream.Model != "concrete" {
+			t.Errorf("step %d stream Upstream = %+v, want the routed provider identity", i+1, streamResp.Upstream)
+		}
+	}
+	if streamEvents[0].FinishReason != "tool_calls" {
+		t.Errorf("step 1 FinishReason = %q, want %q", streamEvents[0].FinishReason, "tool_calls")
+	}
+	if streamEvents[1].FinishReason != "stop" {
+		t.Errorf("step 2 FinishReason = %q, want %q", streamEvents[1].FinishReason, "stop")
+	}
+	// The tool-call-only step emitted no deltas; its metadata still
+	// surfaced through AfterGenerate.
+	for _, ev := range streamDeltas {
+		if ev.Step == 1 {
+			t.Errorf("tool-call-only step emitted delta event %+v", ev)
+		}
+	}
+}
+
+func TestAfterGenerateFinishReasonAskModeEmpty(t *testing.T) {
+	var generated []Event
+	hooks := WithHooks(Hooks{
+		AfterGenerate: func(ctx context.Context, ev *Event) error {
+			generated = append(generated, *ev)
+			return nil
+		},
+	})
+
+	resetScript(t, textTurn("hello"))
+	ag := newFakeAgent(t, hooks)
+	if _, err := ag.Ask(context.Background(), "Hi"); err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if len(generated) != 1 || generated[0].FinishReason != "" {
+		t.Fatalf("ask AfterGenerate FinishReason = %+v, want empty", generated)
+	}
+
+	generated = nil
+	resetScript(t, textTurn("hello"))
+	events, err := ag.AskStream(context.Background(), "Hi")
+	if err != nil {
+		t.Fatalf("AskStream: %v", err)
+	}
+	collectEvents(t, events)
+	if len(generated) != 1 || generated[0].FinishReason != "stop" {
+		t.Fatalf("streaming AfterGenerate FinishReason = %+v, want %q", generated, "stop")
+	}
+}
+
 func TestAskStreamOnDeltaHook(t *testing.T) {
 	resetScript(t,
 		streamTurn(

@@ -96,6 +96,11 @@ type Event struct {
 	// Finish reports — and may be flipped to change — whether the response
 	// ends the run: true when it carried no tool calls (AfterGenerate).
 	Finish bool
+	// FinishReason is how the streamed response ended, in OpenAI vocabulary
+	// (stop, length, tool_calls). It is populated on AfterGenerate in
+	// AskStream mode and empty in Ask mode, which has no finish reason.
+	// Delta events carry it when their producing chunk reported one.
+	FinishReason string
 	// Response is the model response (AfterGenerate).
 	Response *llmhub.Response
 	// Call is the model-requested tool call (tool events).
@@ -114,6 +119,21 @@ type Event struct {
 	// Timing carries llmhub latency telemetry snapshots (reserved for
 	// streaming and Done).
 	Timing *llmhub.TimingMetrics
+	// ID is the producing chunk's upstream completion identifier (delta
+	// events). AfterGenerate exposes the step's ID through Response.ID.
+	ID string
+	// Upstream identifies the HTTP upstream that answered (status code,
+	// headers, vendor-reported provider and model) as reported by the
+	// producing chunk (delta events). AfterGenerate exposes the step's
+	// upstream through Response.Upstream.
+	Upstream *llmhub.UpstreamInfo
+	// ReasoningDetails carries structured reasoning (summaries, signed
+	// text, encrypted blocks) as reported by the producing chunk (delta
+	// events). Each delta holds only its own chunk's details — append
+	// across deltas for the full set, mirroring llmhub's chunk semantics.
+	// AfterGenerate exposes the step's accumulated details through
+	// Response.ReasoningDetails.
+	ReasoningDetails []llmhub.ReasoningDetail
 	// Answer is the fully populated result (Done).
 	Answer *Answer
 }

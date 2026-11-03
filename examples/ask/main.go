@@ -442,6 +442,9 @@ func (cfg *appConfig) runOnce(ctx context.Context, stdin io.Reader, stdout, stde
 		core, runErr := p.consume(events)
 		p.endLine()
 		res, rerr = newRunResult(handle.kind, core), runErr
+		if res != nil {
+			res.upstream = p.upstream
+		}
 	} else {
 		res, rerr = handle.ask(ctx, cfg.promptText)
 	}

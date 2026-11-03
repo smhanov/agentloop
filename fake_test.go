@@ -17,25 +17,31 @@ import (
 // fields serve both Generate (directly) and Stream (synthesized into
 // chunks); an explicit chunks script overrides synthesis in Stream.
 type fakeTurn struct {
-	text      string
-	reasoning string
-	calls     []*llmhub.ToolCallContent
-	usage     llmhub.UsageMetadata
-	err       error
-	chunks    []fakeChunk // explicit streaming script (optional)
-	stall     bool        // streaming: hang without Done after the chunks
+	text             string
+	reasoning        string
+	calls            []*llmhub.ToolCallContent
+	usage            llmhub.UsageMetadata
+	reasoningDetails []llmhub.ReasoningDetail
+	upstream         *llmhub.UpstreamInfo
+	err              error
+	chunks           []fakeChunk // explicit streaming script (optional)
+	stall            bool        // streaming: hang without Done after the chunks
 }
 
 // fakeChunk is one scripted StreamChunk.
 type fakeChunk struct {
-	delta      string
-	reasoning  string
-	calls      []*llmhub.ToolCallContent // fragments, merged by Index
-	usage      *llmhub.UsageMetadata
-	timing     *llmhub.TimingMetrics
-	done       bool
-	err        error
-	afterClose chan struct{} // closed right after this chunk is delivered
+	delta            string
+	reasoning        string
+	calls            []*llmhub.ToolCallContent // fragments, merged by Index
+	usage            *llmhub.UsageMetadata
+	timing           *llmhub.TimingMetrics
+	id               string
+	upstream         *llmhub.UpstreamInfo
+	reasoningDetails []llmhub.ReasoningDetail
+	finishReason     string
+	done             bool
+	err              error
+	afterClose       chan struct{} // closed right after this chunk is delivered
 }
 
 // textTurn scripts a text-only response.
@@ -72,7 +78,12 @@ func (fakeProvider) Generate(ctx context.Context, prompt []*llmhub.Message, opts
 	if turn.err != nil {
 		return nil, turn.err
 	}
-	resp := &llmhub.Response{ID: fmt.Sprintf("fake-gen-%d", fakeState.count()), Usage: turn.usage}
+	resp := &llmhub.Response{
+		ID:               fmt.Sprintf("fake-gen-%d", fakeState.count()),
+		Usage:            turn.usage,
+		ReasoningDetails: turn.reasoningDetails,
+		Upstream:         turn.upstream,
+	}
 	if turn.reasoning != "" {
 		resp.Content = append(resp.Content, llmhub.Reasoning(turn.reasoning))
 	}
@@ -95,7 +106,7 @@ func (fakeProvider) Stream(ctx context.Context, prompt []*llmhub.Message, opts .
 	}
 	chunks := turn.chunks
 	if chunks == nil {
-		chunks = synthesizeChunks(turn)
+		chunks = synthesizeChunks(turn, fmt.Sprintf("fake-gen-%d", fakeState.count()))
 	}
 	ch := make(chan llmhub.StreamChunk)
 	go func() {
@@ -105,7 +116,17 @@ func (fakeProvider) Stream(ctx context.Context, prompt []*llmhub.Message, opts .
 				ch <- llmhub.StreamChunk{Err: c.err}
 				return
 			}
-			wire := llmhub.StreamChunk{Delta: c.delta, ReasoningDelta: c.reasoning, Usage: c.usage, Timing: c.timing, Done: c.done}
+			wire := llmhub.StreamChunk{
+				ID:               c.id,
+				Delta:            c.delta,
+				ReasoningDelta:   c.reasoning,
+				ReasoningDetails: c.reasoningDetails,
+				Usage:            c.usage,
+				FinishReason:     c.finishReason,
+				Timing:           c.timing,
+				Upstream:         c.upstream,
+				Done:             c.done,
+			}
 			for _, call := range c.calls {
 				wire.ToolCalls = append(wire.ToolCalls, call)
 			}
@@ -127,23 +148,42 @@ func (fakeProvider) Stream(ctx context.Context, prompt []*llmhub.Message, opts .
 }
 
 // synthesizeChunks builds a simple streaming script from a plain turn: one
-// chunk per reasoning/text part, one fragment chunk per tool call, then a
-// terminal Done chunk carrying the usage and a complete timing snapshot.
-func synthesizeChunks(turn fakeTurn) []fakeChunk {
+// chunk per reasoning/text part, one chunk for structured reasoning details,
+// one fragment chunk per tool call, then a terminal Done chunk carrying the
+// usage, upstream snapshot, and a complete timing snapshot. The completion ID
+// is repeated on every chunk, and the final content chunk reports the finish
+// reason, mirroring provider streams.
+func synthesizeChunks(turn fakeTurn, id string) []fakeChunk {
 	var chunks []fakeChunk
 	if turn.reasoning != "" {
-		chunks = append(chunks, fakeChunk{reasoning: turn.reasoning})
+		chunks = append(chunks, fakeChunk{id: id, reasoning: turn.reasoning})
+	}
+	if len(turn.reasoningDetails) > 0 {
+		chunks = append(chunks, fakeChunk{id: id, reasoningDetails: turn.reasoningDetails})
 	}
 	if turn.text != "" {
-		chunks = append(chunks, fakeChunk{delta: turn.text})
+		chunks = append(chunks, fakeChunk{id: id, delta: turn.text})
 	}
 	for i, call := range turn.calls {
 		frag := *call
 		frag.Index = i
-		chunks = append(chunks, fakeChunk{calls: []*llmhub.ToolCallContent{&frag}})
+		chunks = append(chunks, fakeChunk{id: id, calls: []*llmhub.ToolCallContent{&frag}})
+	}
+	if len(chunks) > 0 {
+		chunks[len(chunks)-1].finishReason = "stop"
+		if len(turn.calls) > 0 {
+			chunks[len(chunks)-1].finishReason = "tool_calls"
+		}
 	}
 	timing := &llmhub.TimingMetrics{Chunks: len(chunks) + 1, Total: 2 * time.Millisecond}
-	return append(chunks, fakeChunk{done: true, usage: &turn.usage, timing: timing})
+	done := fakeChunk{id: id, done: true, usage: &turn.usage, timing: timing}
+	if turn.upstream != nil {
+		done.upstream = turn.upstream
+		if len(chunks) > 0 {
+			chunks[0].upstream = turn.upstream
+		}
+	}
+	return append(chunks, done)
 }
 
 // fakeHarness is the scripted-provider state shared by the test binary.

@@ -24,6 +24,7 @@ type runResult struct {
 	core       *agentloop.Answer
 	exitStatus string
 	submission string
+	upstream   *llmhub.UpstreamInfo // final streamed step's upstream, when reported
 }
 
 // newRunResult builds a runResult from a core answer. The bash exit
@@ -115,6 +116,9 @@ func printTrace(stderr io.Writer, res *runResult) {
 	if core.Timing != nil {
 		line += fmt.Sprintf(" ttft=%v total=%v", core.Timing.FirstToken, core.Timing.Total)
 	}
+	if res.upstream != nil && (res.upstream.Provider != "" || res.upstream.Model != "") {
+		line += fmt.Sprintf(" provider=%s model=%s", res.upstream.Provider, res.upstream.Model)
+	}
 	fmt.Fprintln(stderr, line)
 }
 
@@ -125,7 +129,8 @@ type streamPrinter struct {
 	stdout   io.Writer
 	stderr   io.Writer
 	verbose  bool
-	lineOpen bool // last stdout delta had no trailing newline
+	lineOpen bool                 // last stdout delta had no trailing newline
+	upstream *llmhub.UpstreamInfo // final step's upstream, when reported
 }
 
 // consume drains events until the channel closes and returns the final
@@ -159,6 +164,10 @@ func (p *streamPrinter) consume(events <-chan agentloop.Event) (*agentloop.Answe
 				fmt.Fprintf(p.stderr, "trace: tool %s (%v)\n", name, ev.Duration)
 			}
 		case agentloop.EventAfterGenerate:
+			p.upstream = nil
+			if ev.Response != nil {
+				p.upstream = ev.Response.Upstream
+			}
 			if p.verbose {
 				fmt.Fprintf(p.stderr, "trace: step %d\n", ev.Step)
 			}
