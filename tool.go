@@ -238,6 +238,10 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 				if err := fire(ctx, r.cfg.hooks.AfterToolCall, ev); err != nil {
 					return false, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
 				}
+				// The hook may rewrite the synthetic observation too, so the
+				// rewritten payload is what gets appended.
+				plan.result.observation = ev.Result
+				plan.result.trace.Output = ev.Result
 				r.emit(ev)
 			}
 			i++
@@ -413,8 +417,10 @@ func (r *run) planCall(ctx context.Context, step int, call *llmhub.ToolCallConte
 
 // executePlan runs one planned call's handler, renders the observation
 // (in-band error as needed), records the trace entry, and fires
-// AfterToolCall in completion order. Returned errors abort the run: handler
-// context errors and AfterToolCall hook errors.
+// AfterToolCall in completion order. The hook may rewrite the observation;
+// the trace and everything appended afterwards use the rewrite. Returned
+// errors abort the run: handler context errors and AfterToolCall hook
+// errors.
 func (r *run) executePlan(ctx context.Context, step int, plan callPlan) (*stepResult, error) {
 	start := time.Now()
 	output, handlerErr := plan.tool.Run(ctx, plan.args)
@@ -436,7 +442,17 @@ func (r *run) executePlan(ctx context.Context, step int, plan callPlan) (*stepRe
 	}
 	after := &Event{Kind: EventAfterToolCall, Step: step, Call: plan.call, Args: plan.args, Result: observation, Err: handlerErr, Duration: duration}
 	if err := fire(ctx, r.cfg.hooks.AfterToolCall, after); err != nil {
+		// The hook failed, so the run aborts and this observation is never
+		// appended: return the pre-rewrite result unchanged.
 		return res, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
+	}
+	// The hook may rewrite ev.Result, and the rewritten payload is what the
+	// model receives, so rebuild the step result from it: the transcript,
+	// the trace, and duplicate-call accounting all see the rewrite. Ev.Err
+	// keeps the handler outcome for telemetry.
+	res = &stepResult{
+		observation: after.Result,
+		trace:       &ToolResult{Name: plan.call.Name, ID: plan.call.ID, Args: plan.args, Output: after.Result, Err: handlerErr, Duration: duration},
 	}
 	r.emit(after)
 	return res, nil

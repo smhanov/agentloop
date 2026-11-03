@@ -378,7 +378,7 @@ call; copy anything you retain.
 | `RebuildContext` | after `BeforeGenerate`, before the call | Observe or **replace** `Context` — the exact message list the model is about to see (see [recipes](#writing-your-own-agent)) | `Step`, `Messages` (read-only transcript), `Context` |
 | `AfterGenerate` | after each LLM response | **Append** to `Messages`; flip `Finish` (the finish veto) | `Step`, `Messages`, `Response`, `Finish`, `FinishReason` |
 | `BeforeToolCall` | before each tool call | Rewrite `Args`; return `ErrSkipToolCall` to veto; **may block** (approval gates) | `Step`, `Call`, `Args` |
-| `AfterToolCall` | when a tool execution completes | — (fires in completion order) | `Step`, `Call`, `Args`, `Result`, `Err`, `Duration` |
+| `AfterToolCall` | when a tool execution completes | **Rewrite** `Result` (the rewritten payload is what the model sees and what duplicate-call detection judges); fires in completion order | `Step`, `Call`, `Args`, `Result`, `Err`, `Duration` |
 | `OnDelta` | streaming answer/reasoning deltas | — | `Kind`, `Step`, `Delta`, `Timing`, `ID`, `Upstream`, `ReasoningDetails`, `FinishReason` |
 | `OnDone` | once, when the run finishes | — | `Answer` (fully populated), `Timing` |
 | `OnError` | once, on terminal failure | — | `Err` (also returned from `Ask`), `Answer` |
@@ -423,7 +423,7 @@ populated depends on `Kind` (`EventStart`, `EventBeforeGenerate`,
 | `Response` | the model response (`AfterGenerate`) |
 | `Call` | the requested tool call (tool events) |
 | `Args` | raw call arguments; rewritable by `BeforeToolCall` |
-| `Result` | the payload delivered to the model (`AfterToolCall`) |
+| `Result` | the payload delivered to the model (`AfterToolCall`); rewritable — the rewrite is what the transcript, trace, and duplicate detection see |
 | `Err` | associated error (`AfterToolCall` handler errors, `EventError`) |
 | `Duration` | the tool execution's wall time (`AfterToolCall`) |
 | `Delta` | incremental streamed text (`OnDelta`) |

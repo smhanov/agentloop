@@ -58,8 +58,10 @@ type Hooks struct {
 	// BeforeToolCall fires before each tool call; it may rewrite ev.Args,
 	// and returning ErrSkipToolCall vetoes the execution.
 	BeforeToolCall func(ctx context.Context, ev *Event) error
-	// AfterToolCall fires when a tool execution completes; ev.Result,
-	// ev.Err, and ev.Duration describe the execution.
+	// AfterToolCall fires when a tool execution completes. It may rewrite
+	// ev.Result: the rewritten payload is what the model sees (transcript
+	// and trace), and duplicate-call detection judges it. ev.Err and
+	// ev.Duration still describe the execution.
 	AfterToolCall func(ctx context.Context, ev *Event) error
 	// OnDelta receives streaming answer/reasoning deltas (EventAnswerDelta
 	// / EventReasoningDelta distinguishes them) in stream order, in
@@ -107,7 +109,10 @@ type Event struct {
 	Call *llmhub.ToolCallContent
 	// Args holds the raw call arguments; BeforeToolCall may rewrite them.
 	Args json.RawMessage
-	// Result is the payload delivered to the model (AfterToolCall).
+	// Result is the payload delivered to the model (AfterToolCall). It is
+	// rewritable: a rewrite replaces the transcript and trace payload and is
+	// what duplicate-call detection judges. The empty string is a legal
+	// rewrite.
 	Result string
 	// Err is the error associated with the event (AfterToolCall handler
 	// errors, Error).
