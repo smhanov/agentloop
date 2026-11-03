@@ -42,7 +42,12 @@ var budgetedPackages = map[string]string{
 // agentloop 112, search 51, bash 33) plus 10%, rounded up, so ordinary
 // work is not blocked while any real API addition forces a conscious
 // decision.
-const exportedAPICeiling = 216
+//
+// 218 (measured: agentloop 134, search 51, bash 33) raises the previous
+// ceiling of 216 for the two-symbol fs.FS skills surface: LoadSkillsFS and
+// WithSkillsFS make "ship the skill pack inside the binary" a first-class
+// loading mode alongside disk roots, rather than an incidental helper.
+const exportedAPICeiling = 218
 
 // countExportedSymbols parses the package in dir (non-test files only)
 // and returns its exported-symbol count per the rule above.
