@@ -192,6 +192,11 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 			return r.fail(err)
 		}
 
+		// Some providers omit arguments for no-argument tool calls.
+		// Normalize before the assistant message is appended so the
+		// transcript, hooks, and handlers all observe valid JSON.
+		normalizeToolCallArgs(resp)
+
 		// Append the assistant message verbatim (tool-call parts preserved)
 		// and accumulate the step's telemetry.
 		r.transcript = append(r.transcript, llmhub.NewAssistantMessage(resp.Content...))
@@ -232,6 +237,19 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 		}
 		if stopped {
 			return r.finish(StatusStopped)
+		}
+	}
+}
+
+// normalizeToolCallArgs replaces omitted (empty) tool-call arguments with
+// "{}", the smallest valid JSON object. Providers may omit the arguments
+// field for no-argument calls; without normalization, handlers that
+// unmarshal receive invalid JSON and strict OpenAI-compatible servers reject
+// the replayed transcript because the field is required.
+func normalizeToolCallArgs(resp *llmhub.Response) {
+	for _, part := range resp.Content {
+		if call, ok := part.(*llmhub.ToolCallContent); ok && call.Arguments == "" {
+			call.Arguments = "{}"
 		}
 	}
 }

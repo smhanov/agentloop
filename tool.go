@@ -13,11 +13,12 @@ import (
 )
 
 // Handler executes a tool invocation. args is the raw JSON arguments string
-// from the model (llmhub ToolCallContent.Arguments). The return value is
-// inserted verbatim as the tool result message content; a returned error is
-// delivered to the model as an {"error": ...} observation and the loop
-// continues, except for context errors (cancellation or deadline), which
-// abort the run.
+// from the model (llmhub ToolCallContent.Arguments). The loop normalizes
+// omitted arguments to "{}", so args is always valid JSON, even for
+// no-argument calls. The return value is inserted verbatim as the tool
+// result message content; a returned error is delivered to the model as an
+// {"error": ...} observation and the loop continues, except for context
+// errors (cancellation or deadline), which abort the run.
 type Handler func(ctx context.Context, args json.RawMessage) (string, error)
 
 // Tool is one model-callable tool: its llmhub definition plus the Go

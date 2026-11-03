@@ -2,6 +2,7 @@ package agentloop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -274,5 +275,78 @@ func TestAskStreamScriptExhaustedFails(t *testing.T) {
 	}
 	if evs[len(evs)-1].Err == nil {
 		t.Error("EventError without an error")
+	}
+}
+
+func TestAskStreamEmptyToolCallArgumentsNormalized(t *testing.T) {
+	var handlerArgs []string
+	lookup := Tool{
+		Def: llmhub.NewTool("lookup", "Look something up", map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		}),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			var parsed map[string]any
+			if err := json.Unmarshal(args, &parsed); err != nil {
+				return "", err
+			}
+			handlerArgs = append(handlerArgs, string(args))
+			return "found", nil
+		},
+	}
+	resetScript(t,
+		streamTurn(
+			fakeChunk{delta: "checking "},
+			// The fragment carries no arguments; mergeToolCallFragment
+			// leaves the merged call's Arguments empty.
+			fakeChunk{calls: []*llmhub.ToolCallContent{llmhub.ToolCallWithIndex(0, "call-1", "lookup", "")}},
+			fakeChunk{done: true},
+		),
+		streamTurn(fakeChunk{delta: "done"}, fakeChunk{done: true}),
+	)
+	ag := newFakeAgent(t, WithTools(lookup))
+
+	events, err := ag.AskStream(context.Background(), "look it up")
+	if err != nil {
+		t.Fatalf("AskStream: %v", err)
+	}
+	evs := collectEvents(t, events)
+
+	var ans *Answer
+	for _, ev := range evs {
+		if ev.Kind == EventDone {
+			ans = ev.Answer
+		}
+	}
+	if ans == nil {
+		t.Fatalf("no Done event in %v", kindsOf(evs))
+	}
+	if ans.Status != StatusCompleted || ans.Text != "done" {
+		t.Fatalf("status/text = %v/%q, want completed/%q", ans.Status, ans.Text, "done")
+	}
+	if len(handlerArgs) != 1 || handlerArgs[0] != "{}" {
+		t.Errorf("handler args = %q, want [\"{}\"]", handlerArgs)
+	}
+	if len(ans.Tools) != 1 {
+		t.Fatalf("trace = %+v, want one entry", ans.Tools)
+	}
+	if got := string(ans.Tools[0].Args); got != "{}" {
+		t.Errorf("trace args = %q, want %q", got, "{}")
+	}
+	if ans.Tools[0].Err != nil || ans.Tools[0].Output != "found" {
+		t.Errorf("trace result = (%q, %v), want (%q, nil)", ans.Tools[0].Output, ans.Tools[0].Err, "found")
+	}
+
+	var transcriptArgs []string
+	for _, msg := range ans.Messages {
+		if msg.Role != llmhub.RoleAssistant {
+			continue
+		}
+		for _, call := range callsOf(msg) {
+			transcriptArgs = append(transcriptArgs, call.Arguments)
+		}
+	}
+	if len(transcriptArgs) != 1 || transcriptArgs[0] != "{}" {
+		t.Errorf("transcript tool-call args = %q, want [\"{}\"]", transcriptArgs)
 	}
 }

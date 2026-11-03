@@ -304,7 +304,9 @@ per-call options apply after the constructor's, so the later one wins.
 
 A tool is an llmhub definition plus a Go handler. The handler receives the
 model's raw JSON arguments and returns the payload inserted verbatim as
-the tool result:
+the tool result. Providers may omit `arguments` for no-argument calls; the
+loop normalizes them to `"{}"`, so handlers always receive valid JSON and
+replayed transcripts keep the field on strict OpenAI-compatible servers:
 
 ```go
 clock := agentloop.Tool{
