@@ -253,11 +253,33 @@ func (r *run) execute(ctx context.Context, llm *llmhub.Client, query string) (*A
 			return r.finish(StatusCompleted)
 		}
 
-		stopped, err := r.dispatchAll(ctx, step, calls)
+		stepResults, stopped, err := r.dispatchAll(ctx, step, calls)
 		if err != nil {
 			return r.fail(err)
 		}
-		if stopped {
+
+		// Hook: the step as a unit. It fires after every per-call
+		// AfterToolCall and after the result appends, before the next
+		// BeforeGenerate. Appends to Messages persist; Skip stops the run
+		// gracefully. A duplicate-call stop still fires the hook so it
+		// observes the batch that tripped.
+		batch := &Event{
+			Kind:     EventAfterToolBatch,
+			Step:     step,
+			Messages: r.transcript,
+			Results:  append([]ToolResult(nil), stepResults...),
+		}
+		if err := fire(ctx, hooks.AfterToolBatch, batch); err != nil {
+			return r.fail(fmt.Errorf("agentloop: AfterToolBatch hook: %w", err))
+		}
+		r.transcript = batch.Messages
+		r.emit(&Event{
+			Kind:     EventAfterToolBatch,
+			Step:     step,
+			Messages: r.transcript,
+			Results:  append([]ToolResult(nil), stepResults...),
+		})
+		if batch.Skip || stopped {
 			return r.finish(StatusStopped)
 		}
 	}

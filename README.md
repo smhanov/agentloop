@@ -352,8 +352,9 @@ naming an unregistered tool gets `{"error": "unknown tool; did you mean
 `{"error": "unknown tool"}` — both count against the tool budget. When
 one response requests several calls, parallel-eligible tools execute
 concurrently while `Sequential` tools run strictly in call order; tool
-results are always appended in original call order, and `AfterToolCall`
-fires as each execution completes.
+results are always appended in original call order; `AfterToolCall` fires
+as each execution completes, and `AfterToolBatch` fires once the whole
+batch has been appended.
 
 Set `Repetitive: true` for polling or status tools. It exempts the tool
 from duplicate-call loop detection: identical calls are expected, and a
@@ -379,6 +380,7 @@ call; copy anything you retain.
 | `AfterGenerate` | after each LLM response | **Append** to `Messages`; flip `Finish` (the finish veto) | `Step`, `Messages`, `Response`, `Finish`, `FinishReason` |
 | `BeforeToolCall` | before each tool call | Rewrite `Args`; return `ErrSkipToolCall` to veto; **may block** (approval gates) | `Step`, `Call`, `Args` |
 | `AfterToolCall` | when a tool execution completes | **Rewrite** `Result` (the rewritten payload is what the model sees and what duplicate-call detection judges); fires in completion order | `Step`, `Call`, `Args`, `Result`, `Err`, `Duration` |
+| `AfterToolBatch` | after a step's tool calls have all executed and their results are appended | **Append** to `Messages` (appends become permanent transcript entries); set `Skip` for a graceful stop; never fires before the run's first inference, and not for steps that executed no calls | `Step`, `Messages`, `Skip`, `Results` |
 | `OnDelta` | streaming answer/reasoning deltas | — | `Kind`, `Step`, `Delta`, `Timing`, `ID`, `Upstream`, `ReasoningDetails`, `FinishReason` |
 | `OnDone` | once, when the run finishes | — | `Answer` (fully populated), `Timing` |
 | `OnError` | once, on terminal failure | — | `Err` (also returned from `Ask`), `Answer` |
@@ -404,11 +406,21 @@ keeps the loop running (this is how text-action protocols work; the bash
 preset is the working example), and `true` on a tool-call response stops
 immediately without executing the tools.
 
+**Per-step batches.** `AfterToolBatch` fires once after a step's tool
+calls have all executed and their results are appended — after every
+per-call `AfterToolCall` of that step and before the next
+`BeforeGenerate`, never before the run's first inference. `Results`
+carries the step's outcomes in call order, so a hook can aggregate or
+compare them and decide before the next inference instead of counting
+calls in `AfterGenerate`. Appends to `Messages` are permanent, `Skip`
+stops the run gracefully (`StatusStopped`), and a duplicate-call stop
+still fires the batch event before the run finishes.
+
 `Event` is one plain struct for all hook kinds; which fields are
 populated depends on `Kind` (`EventStart`, `EventBeforeGenerate`,
 `EventRebuildContext`, `EventAfterGenerate`, `EventAnswerDelta`,
 `EventReasoningDelta`, `EventBeforeToolCall`, `EventAfterToolCall`,
-`EventDone`, `EventError`, `EventCompact`):
+`EventAfterToolBatch`, `EventDone`, `EventError`, `EventCompact`):
 
 | Field | Meaning |
 | --- | --- |
@@ -424,6 +436,7 @@ populated depends on `Kind` (`EventStart`, `EventBeforeGenerate`,
 | `Call` | the requested tool call (tool events) |
 | `Args` | raw call arguments; rewritable by `BeforeToolCall` |
 | `Result` | the payload delivered to the model (`AfterToolCall`); rewritable — the rewrite is what the transcript, trace, and duplicate detection see |
+| `Results` | the step's tool results in call order (`AfterToolBatch`): one entry per appended result — the trace entry for executed and unknown-name calls, a synthesized entry for observations resolved without execution (vetoed skip, budget denial, duplicate-limit stop) |
 | `Err` | associated error (`AfterToolCall` handler errors, `EventError`) |
 | `Duration` | the tool execution's wall time (`AfterToolCall`) |
 | `Delta` | incremental streamed text (`OnDelta`) |

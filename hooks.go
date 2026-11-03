@@ -21,6 +21,7 @@ const (
 	EventReasoningDelta
 	EventBeforeToolCall
 	EventAfterToolCall
+	EventAfterToolBatch
 	EventDone
 	EventError
 	EventCompact
@@ -63,6 +64,16 @@ type Hooks struct {
 	// and trace), and duplicate-call detection judges it. ev.Err and
 	// ev.Duration still describe the execution.
 	AfterToolCall func(ctx context.Context, ev *Event) error
+	// AfterToolBatch fires once after a step's tool calls have all
+	// executed and their results are appended — after every per-call
+	// AfterToolCall of the step and before the next BeforeGenerate. It
+	// never fires before the run's first inference, and it does not fire
+	// for a step that executed no calls (a text-only response, a vetoed
+	// text-only step, or the forced-final step that executes nothing).
+	// Results carries the step's results in call order. The hook may
+	// APPEND to ev.Messages (the appends are permanent transcript entries)
+	// and may set ev.Skip to stop gracefully before the next inference.
+	AfterToolBatch func(ctx context.Context, ev *Event) error
 	// OnDelta receives streaming answer/reasoning deltas (EventAnswerDelta
 	// / EventReasoningDelta distinguishes them) in stream order, in
 	// addition to the AskStream channel.
@@ -114,6 +125,14 @@ type Event struct {
 	// what duplicate-call detection judges. The empty string is a legal
 	// rewrite.
 	Result string
+	// Results holds the step's tool results in call order (AfterToolBatch):
+	// one entry per tool result message appended for the step. Calls with a
+	// trace entry (executed and unknown-name calls) carry it — the
+	// post-rewrite payload, the handler error, and the duration; calls
+	// resolved without execution (vetoed skip, budget denial,
+	// duplicate-limit stop) carry a synthesized entry with the delivered
+	// observation and no error or duration.
+	Results []ToolResult
 	// Err is the error associated with the event (AfterToolCall handler
 	// errors, Error).
 	Err error

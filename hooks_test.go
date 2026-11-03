@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -624,5 +626,417 @@ func TestAfterToolCallRewriteUnknownTool(t *testing.T) {
 	}
 	if len(toolMsgs) != 1 || toolMsgs[0] != scrubbed {
 		t.Errorf("transcript tool messages = %q, want [%q]", toolMsgs, scrubbed)
+	}
+}
+
+// TestAfterToolBatchFiresOncePerStep pins the seam's position in loop
+// order: exactly one event per tool-carrying step, after that step's last
+// AfterToolCall and before the next BeforeGenerate, never before the first
+// inference.
+func TestAfterToolBatchFiresOncePerStep(t *testing.T) {
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		callTurn(llmhub.ToolCall("c2", "echo", `{}`)),
+		textTurn("done"),
+	)
+	var order []string
+	var steps []int
+	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+		BeforeGenerate: func(ctx context.Context, ev *Event) error {
+			order = append(order, fmt.Sprintf("before:%d", ev.Step))
+			return nil
+		},
+		AfterToolCall: func(ctx context.Context, ev *Event) error {
+			order = append(order, "after-call:"+ev.Call.ID)
+			return nil
+		},
+		AfterToolBatch: func(ctx context.Context, ev *Event) error {
+			order = append(order, fmt.Sprintf("after-batch:%d", ev.Step))
+			steps = append(steps, ev.Step)
+			return nil
+		},
+	}))
+
+	ans, err := ag.Ask(context.Background(), "Two batches.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusCompleted || ans.Steps != 3 {
+		t.Fatalf("got Status=%v Steps=%d", ans.Status, ans.Steps)
+	}
+
+	// The whole global order: the batch event lands after the step's call
+	// events and before the next inference's BeforeGenerate; the third
+	// (text-only) step fires nothing.
+	want := []string{
+		"before:1", "after-call:c1", "after-batch:1",
+		"before:2", "after-call:c2", "after-batch:2",
+		"before:3",
+	}
+	if !reflect.DeepEqual(order, want) {
+		t.Errorf("hook order = %v, want %v", order, want)
+	}
+	if !reflect.DeepEqual(steps, []int{1, 2}) {
+		t.Errorf("batch steps = %v, want [1 2]", steps)
+	}
+}
+
+// TestAfterToolBatchResultsInCallOrder releases a parallel batch out of
+// call order and verifies the single batch event reports the results in
+// call order, with the appended tool messages on ev.Messages.
+func TestAfterToolBatchResultsInCallOrder(t *testing.T) {
+	log := &callLog{}
+	onstart := make(chan string, 3)
+	t1, t2, t3, gates := parallelScript(log, onstart)
+	resetScript(t,
+		callTurn(
+			llmhub.ToolCall("c1", "t1", `{}`),
+			llmhub.ToolCall("c2", "t2", `{}`),
+			llmhub.ToolCall("c3", "t3", `{}`),
+		),
+		textTurn("ok"),
+	)
+	completions := make(chan string, 3)
+	batches := make(chan Event, 1)
+	ag := newFakeAgent(t, WithTools(t1, t2, t3), WithHooks(Hooks{
+		AfterToolCall: func(ctx context.Context, ev *Event) error {
+			completions <- ev.Call.ID
+			return nil
+		},
+		AfterToolBatch: func(ctx context.Context, ev *Event) error {
+			batches <- *ev
+			return nil
+		},
+	}))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := ag.Ask(context.Background(), "Fan out.")
+		done <- err
+	}()
+
+	// All three handlers are in flight before any gate opens.
+	var starts []string
+	for range []int{0, 1, 2} {
+		starts = append(starts, <-onstart)
+	}
+	sort.Strings(starts)
+	if !reflect.DeepEqual(starts, []string{"t1", "t2", "t3"}) {
+		t.Fatalf("starts = %v, want all three", starts)
+	}
+
+	// Release in reverse call order, one at a time, so completion order is
+	// deterministic and differs from call order.
+	release := []int{2, 0, 1}
+	for i, want := range []string{"c3", "c1", "c2"} {
+		close(gates[release[i]])
+		if got := <-completions; got != want {
+			t.Fatalf("completion %d = %q, want %q", i, got, want)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+
+	batch := <-batches
+	if batch.Kind != EventAfterToolBatch || batch.Step != 1 {
+		t.Fatalf("batch event = (kind %v, step %d)", batch.Kind, batch.Step)
+	}
+	if len(batch.Results) != 3 {
+		t.Fatalf("results = %d, want 3", len(batch.Results))
+	}
+	wantIDs := []string{"c1", "c2", "c3"}
+	wantNames := []string{"t1", "t2", "t3"}
+	wantOutputs := []string{"done:t1", "done:t2", "done:t3"}
+	for i := range batch.Results {
+		got := batch.Results[i]
+		if got.ID != wantIDs[i] || got.Name != wantNames[i] || got.Output != wantOutputs[i] {
+			t.Errorf("result %d = (%s, %s, %q), want call order (%s, %s, %q)",
+				i, got.ID, got.Name, got.Output, wantIDs[i], wantNames[i], wantOutputs[i])
+		}
+		if got.Duration <= 0 {
+			t.Errorf("result %s duration = %v, want the execution's wall time", got.ID, got.Duration)
+		}
+	}
+
+	// The batch event's Messages already carry the appended results.
+	var toolMsgs []*llmhub.Message
+	for _, m := range batch.Messages {
+		if m.Role == llmhub.RoleTool {
+			toolMsgs = append(toolMsgs, m)
+		}
+	}
+	if len(toolMsgs) != 3 {
+		t.Fatalf("tool messages = %d, want 3", len(toolMsgs))
+	}
+	for i, want := range wantIDs {
+		if toolMsgs[i].Meta["tool_call_id"] != want || textOf(toolMsgs[i]) != wantOutputs[i] {
+			t.Errorf("tool message %d = (%s, %q), want call order", i, toolMsgs[i].Meta["tool_call_id"], textOf(toolMsgs[i]))
+		}
+	}
+}
+
+// TestAfterToolBatchNoFireWithoutCalls covers the steps that execute
+// nothing: a text-only response, a vetoed text-only response, and the
+// forced-final step whose calls are never executed.
+func TestAfterToolBatchNoFireWithoutCalls(t *testing.T) {
+	t.Run("text-only", func(t *testing.T) {
+		resetScript(t, textTurn("done"))
+		events := 0
+		ag := newFakeAgent(t, WithHooks(Hooks{
+			AfterToolBatch: func(ctx context.Context, ev *Event) error {
+				events++
+				return nil
+			},
+		}))
+		ans, err := ag.Ask(context.Background(), "No tools.")
+		if err != nil {
+			t.Fatalf("Ask: %v", err)
+		}
+		if ans.Status != StatusCompleted || events != 0 {
+			t.Errorf("got Status=%v batch events=%d, want completed with 0", ans.Status, events)
+		}
+	})
+
+	t.Run("vetoed text-only", func(t *testing.T) {
+		resetScript(t, textTurn("first"), textTurn("second"))
+		events := 0
+		ag := newFakeAgent(t, WithHooks(Hooks{
+			AfterGenerate: func(ctx context.Context, ev *Event) error {
+				if ev.Step == 1 {
+					ev.Messages = append(ev.Messages, llmhub.NewUserMessage(llmhub.Text("observation")))
+					ev.Finish = false
+				}
+				return nil
+			},
+			AfterToolBatch: func(ctx context.Context, ev *Event) error {
+				events++
+				return nil
+			},
+		}))
+		ans, err := ag.Ask(context.Background(), "Keep going.")
+		if err != nil {
+			t.Fatalf("Ask: %v", err)
+		}
+		if ans.Status != StatusCompleted || ans.Steps != 2 || events != 0 {
+			t.Errorf("got Status=%v Steps=%d batch events=%d, want completed/2/0", ans.Status, ans.Steps, events)
+		}
+	})
+
+	t.Run("forced-final calls execute nothing", func(t *testing.T) {
+		resetScript(t,
+			callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+			callTextTurn("giving up", llmhub.ToolCall("c2", "echo", `{}`)),
+		)
+		var steps []int
+		ag := newFakeAgent(t, WithTools(echoTool()), WithMaxToolCalls(1), WithHooks(Hooks{
+			AfterToolBatch: func(ctx context.Context, ev *Event) error {
+				steps = append(steps, ev.Step)
+				return nil
+			},
+		}))
+		ans, err := ag.Ask(context.Background(), "One call only.")
+		if err != nil {
+			t.Fatalf("Ask: %v", err)
+		}
+		if ans.Status != StatusCompleted || ans.Steps != 2 || ans.ToolCalls != 1 {
+			t.Fatalf("got Status=%v Steps=%d ToolCalls=%d", ans.Status, ans.Steps, ans.ToolCalls)
+		}
+		// Only the executing step fired; the forced-final step did not.
+		if !reflect.DeepEqual(steps, []int{1}) {
+			t.Errorf("batch steps = %v, want [1] (the forced-final step executed nothing)", steps)
+		}
+		if len(ans.Tools) != 1 || ans.Tools[0].ID != "c1" {
+			t.Errorf("trace = %+v, want only c1", ans.Tools)
+		}
+	})
+}
+
+// TestAfterToolBatchAppendPersists pins the append seam: a message added
+// on the batch event is permanent and reaches the next request after the
+// step's tool results.
+func TestAfterToolBatchAppendPersists(t *testing.T) {
+	const guidance = "steer: summarize what you found"
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		textTurn("done"),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+		AfterToolBatch: func(ctx context.Context, ev *Event) error {
+			if ev.Step == 1 {
+				ev.Messages = append(ev.Messages, llmhub.NewUserMessage(llmhub.Text(guidance)))
+			}
+			return nil
+		},
+	}))
+
+	ans, err := ag.Ask(context.Background(), "Steer the batch.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	found := false
+	for _, m := range ans.Messages {
+		if textOf(m) == guidance {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("appended guidance missing from the permanent transcript")
+	}
+
+	reqs := fakeRequests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d, want 2", len(reqs))
+	}
+	step2 := reqs[1].prompt
+	if got := textOf(step2[len(step2)-1]); got != guidance {
+		t.Errorf("model saw %q as the last prompt message, want the appended guidance", got)
+	}
+	if prev := step2[len(step2)-2]; prev.Role != llmhub.RoleTool || textOf(prev) != "echo:{}" {
+		t.Errorf("message before the guidance = (%v, %q), want the step's tool result", prev.Role, textOf(prev))
+	}
+}
+
+// TestAfterToolBatchSkipStops pins the graceful stop: Skip finishes the
+// run StatusStopped after the batch, before the next inference.
+func TestAfterToolBatchSkipStops(t *testing.T) {
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		textTurn("never reached"),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+		AfterToolBatch: func(ctx context.Context, ev *Event) error {
+			ev.Skip = true
+			return nil
+		},
+	}))
+
+	ans, err := ag.Ask(context.Background(), "Stop after the batch.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusStopped {
+		t.Errorf("Status = %v, want StatusStopped", ans.Status)
+	}
+	if ans.ToolCalls != 1 || len(ans.Tools) != 1 {
+		t.Errorf("got ToolCalls=%d Tools=%d, want the batch's one call", ans.ToolCalls, len(ans.Tools))
+	}
+	if got := len(fakeRequests()); got != 1 {
+		t.Errorf("requests = %d, want 1 (no inference after Skip)", got)
+	}
+}
+
+// TestAfterToolBatchErrorAborts pins the error path: the wrapped error
+// names the hook and no further inference happens.
+func TestAfterToolBatchErrorAborts(t *testing.T) {
+	errBoom := errors.New("batch exploded")
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		textTurn("never reached"),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()), WithHooks(Hooks{
+		AfterToolBatch: func(ctx context.Context, ev *Event) error { return errBoom },
+	}))
+
+	_, err := ag.Ask(context.Background(), "Fail after the batch.")
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("error = %v, want errBoom", err)
+	}
+	if !strings.Contains(err.Error(), "AfterToolBatch") {
+		t.Errorf("error %q does not name the hook", err)
+	}
+	if got := len(fakeRequests()); got != 1 {
+		t.Errorf("requests = %d, want 1 (the run aborted at the batch)", got)
+	}
+}
+
+// TestAfterToolBatchDupStopStillFires pins the duplicate-limit interaction:
+// the step that trips the limit still fires the batch event, with the stop
+// observation among its results, and only then does the run finish stopped.
+func TestAfterToolBatchDupStopStillFires(t *testing.T) {
+	const args = `{"n":1}`
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", args)),
+		callTurn(llmhub.ToolCall("c2", "echo", args)),
+		callTurn(llmhub.ToolCall("c3", "echo", args)),
+		textTurn("never reached"),
+	)
+	var batches []Event
+	ag := newFakeAgent(t, WithTools(echoTool()), WithDupCallLimit(2), WithHooks(Hooks{
+		AfterToolBatch: func(ctx context.Context, ev *Event) error {
+			batches = append(batches, *ev)
+			return nil
+		},
+	}))
+
+	ans, err := ag.Ask(context.Background(), "Repeat.")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ans.Status != StatusStopped {
+		t.Fatalf("Status = %v, want StatusStopped", ans.Status)
+	}
+	if len(batches) != 3 {
+		t.Fatalf("batch events = %d, want 3 (including the tripping step)", len(batches))
+	}
+	last := batches[2]
+	if last.Step != 3 {
+		t.Errorf("tripping batch step = %d, want 3", last.Step)
+	}
+	if len(last.Results) != 1 || last.Results[0].Output != stopObservation {
+		t.Errorf("tripping results = %+v, want the stop observation", last.Results)
+	}
+	if last.Results[0].ID != "c3" {
+		t.Errorf("tripping result ID = %q, want c3", last.Results[0].ID)
+	}
+	// The stop observation is also the transcript tail the hook observed.
+	tail := last.Messages[len(last.Messages)-1]
+	if tail.Role != llmhub.RoleTool || textOf(tail) != stopObservation {
+		t.Errorf("last observed message = (%v, %q), want the stop observation", tail.Role, textOf(tail))
+	}
+}
+
+// TestAfterToolBatchStreamEvent pins the stream channel: the batch event
+// arrives between the step's per-call AfterToolCall event and the next
+// inference's BeforeGenerate, carrying the step's results.
+func TestAfterToolBatchStreamEvent(t *testing.T) {
+	resetScript(t,
+		callTurn(llmhub.ToolCall("c1", "echo", `{}`)),
+		textTurn("done"),
+	)
+	ag := newFakeAgent(t, WithTools(echoTool()))
+
+	events, err := ag.AskStream(context.Background(), "Stream the batch.")
+	if err != nil {
+		t.Fatalf("AskStream: %v", err)
+	}
+	evs := collectEvents(t, events)
+
+	idx := -1
+	for i, ev := range evs {
+		if ev.Kind != EventAfterToolBatch {
+			continue
+		}
+		if idx >= 0 {
+			t.Fatalf("multiple batch events at %d and %d", idx, i)
+		}
+		idx = i
+	}
+	if idx < 0 {
+		t.Fatal("no EventAfterToolBatch on the stream")
+	}
+	if idx == 0 || evs[idx-1].Kind != EventAfterToolCall {
+		t.Errorf("event before the batch = %v, want the step's AfterToolCall", kindsOf(evs[:idx]))
+	}
+	if idx+1 >= len(evs) || evs[idx+1].Kind != EventBeforeGenerate {
+		t.Errorf("batch event is not followed by the next BeforeGenerate: %v", kindsOf(evs[idx+1:]))
+	}
+	batch := evs[idx]
+	if batch.Step != 1 || len(batch.Results) != 1 || batch.Results[0].Output != "echo:{}" {
+		t.Errorf("batch event = (step %d, results %+v)", batch.Step, batch.Results)
+	}
+	// user, assistant tool-call message, tool result.
+	if got := len(batch.Messages); got != 3 {
+		t.Errorf("batch messages = %d, want 3", got)
 	}
 }

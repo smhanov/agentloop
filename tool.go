@@ -191,15 +191,16 @@ type stepResult struct {
 // (bounded by WithParallelTools) while Sequential tools run strictly in
 // call order and never overlap anything. Tool result messages always
 // append in original call order, while AfterToolCall fires in completion
-// order. It reports stopped=true when the duplicate-call limit was
-// exceeded and the run should finish gracefully.
-func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCallContent) (stopped bool, err error) {
+// order. It returns the step's results in call order and reports
+// stopped=true when the duplicate-call limit was exceeded and the run
+// should finish gracefully.
+func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCallContent) (stepResults []ToolResult, stopped bool, err error) {
 	// Phase A: resolve every call in call order.
 	plans := make([]callPlan, 0, len(calls))
 	for _, call := range calls {
 		plan, err := r.planCall(ctx, step, call)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		plans = append(plans, plan)
 		if plan.mode == planStop {
@@ -236,7 +237,7 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 				// execution.
 				ev := &Event{Kind: EventAfterToolCall, Step: step, Call: plan.call, Args: plan.args, Result: plan.result.observation}
 				if err := fire(ctx, r.cfg.hooks.AfterToolCall, ev); err != nil {
-					return false, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
+					return nil, false, fmt.Errorf("agentloop: AfterToolCall hook: %w", err)
 				}
 				// The hook may rewrite the synthetic observation too, so the
 				// rewritten payload is what gets appended.
@@ -248,7 +249,7 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 		case planExecuteSequential:
 			res, err := r.executePlan(wctx, step, plan)
 			if err != nil {
-				return false, err
+				return nil, false, err
 			}
 			results[i] = res
 			i++
@@ -263,7 +264,7 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 				for k := i; k < j; k++ {
 					res, err := r.executePlan(wctx, step, plans[k])
 					if err != nil {
-						return false, err
+						return nil, false, err
 					}
 					results[k] = res
 				}
@@ -295,11 +296,11 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 			}
 			wg.Wait()
 			if firstErr != nil {
-				return false, firstErr
+				return nil, false, firstErr
 			}
 			if err := wctx.Err(); err != nil {
 				// Outer cancellation left part of the batch unexecuted.
-				return false, err
+				return nil, false, err
 			}
 			i = j
 		}
@@ -325,9 +326,19 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 		r.appendToolResult(plan.call, res.observation)
 		if res.trace != nil {
 			r.trace = append(r.trace, *res.trace)
+			stepResults = append(stepResults, *res.trace)
+			continue
 		}
+		// Calls resolved without execution (vetoed skip, budget denial,
+		// duplicate-limit stop) deliver an observation but leave no trace
+		// entry; the step's batch still reports them, in call order.
+		args := plan.args
+		if len(args) == 0 {
+			args = json.RawMessage(plan.call.Arguments)
+		}
+		stepResults = append(stepResults, ToolResult{Name: plan.call.Name, ID: plan.call.ID, Args: args, Output: res.observation})
 	}
-	return stopped, nil
+	return stepResults, stopped, nil
 }
 
 // noteDupCall applies duplicate-call accounting to one executed call's
