@@ -57,6 +57,12 @@ const (
 	// stopObservation is delivered for one repeat too many; the run then
 	// stops gracefully with StatusStopped.
 	stopObservation = `{"warning": "repeated identical call; stopping"}`
+	// stopSkippedResult is delivered for the calls that rode the same
+	// assistant message as a duplicate-limit stop but were never planned:
+	// resolution stops at the tripping call, so they neither run nor count.
+	// They still receive a result, because the assistant message they belong
+	// to must be answered in full before the recorded turn is remembered.
+	stopSkippedResult = `{"warning": "not executed: the run stopped on a repeated identical call"}`
 	// budgetObservation is delivered for calls denied because the
 	// MaxToolCalls budget was spent.
 	budgetObservation = `{"error": "tool call budget exhausted"}`
@@ -205,7 +211,7 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 		plans = append(plans, plan)
 		if plan.mode == planStop {
 			stopped = true
-			break // one repeat too many: trailing calls are ignored
+			break // one repeat too many: the trailing calls are not planned
 		}
 	}
 
@@ -337,6 +343,23 @@ func (r *run) dispatchAll(ctx context.Context, step int, calls []*llmhub.ToolCal
 			args = json.RawMessage(plan.call.Arguments)
 		}
 		stepResults = append(stepResults, ToolResult{Name: plan.call.Name, ID: plan.call.ID, Args: args, Output: res.observation})
+	}
+
+	// The stopping batch may have carried calls after the one that tripped
+	// duplicate detection: resolution stopped there, so they were never
+	// planned and nothing above appended a result for them. Close them now —
+	// the assistant message that requested them must be answered in full, or
+	// the provider rejects the next request that carries the turn.
+	if stopped {
+		for _, call := range calls[len(plans):] {
+			r.appendToolResult(call, stopSkippedResult)
+			stepResults = append(stepResults, ToolResult{
+				Name:   call.Name,
+				ID:     call.ID,
+				Args:   json.RawMessage(call.Arguments),
+				Output: stopSkippedResult,
+			})
+		}
 	}
 	return stepResults, stopped, nil
 }
